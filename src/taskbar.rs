@@ -31,6 +31,80 @@ pub fn compute_strip_rect(tb: RECT, notify: Option<RECT>, width: i32, height: i3
     RECT { left, top, right: left + width, bottom: top + height }
 }
 
+/// True if `rect` horizontally overlaps any span; touching edges don't count.
+pub fn overlaps(rect: RECT, spans: &[(i32, i32)]) -> bool {
+    spans.iter().any(|&(l, r)| rect.left < r && rect.right > l)
+}
+
+/// Horizontal spans of the taskbar's buttons (app buttons, Start, search…),
+/// excluding those inside the notification area. Uses UI Automation, so call
+/// it off the UI thread (the caller must have initialized COM).
+pub fn occupied_spans(tb_hwnd: HWND, notify: Option<RECT>) -> Vec<(i32, i32)> {
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+    use windows::Win32::System::Variant::VARIANT;
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, IUIAutomation, TreeScope_Descendants, UIA_ButtonControlTypeId, UIA_ControlTypePropertyId,
+    };
+    // On Windows 11 the buttons live in a XAML island; searching from
+    // Shell_TrayWnd alone stops at empty containers, so scan the island too.
+    // Scanning Shell_TrayWnd itself is only a fallback (classic taskbars):
+    // on Windows 11 it costs ~25 ms to find nothing.
+    let mut roots: Vec<HWND> = [w!("Windows.UI.Composition.DesktopWindowContentBridge"), w!("MSTaskListWClass")]
+        .into_iter()
+        .filter_map(|class| unsafe { FindWindowExW(Some(tb_hwnd), None, class, PCWSTR::null()) }.ok())
+        .collect();
+    if roots.is_empty() {
+        roots.push(tb_hwnd);
+    }
+    thread_local! {
+        static UIA: std::cell::OnceCell<Option<IUIAutomation>> = const { std::cell::OnceCell::new() };
+    }
+    let Some(uia) = UIA.with(|c| c.get_or_init(|| unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok() }).clone()) else {
+        return Vec::new();
+    };
+    let scan = |hwnd: HWND| -> windows::core::Result<Vec<(i32, i32)>> {
+        unsafe {
+            let root = uia.ElementFromHandle(hwnd)?;
+            let cond = uia.CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(UIA_ButtonControlTypeId.0))?;
+            let found = root.FindAll(TreeScope_Descendants, &cond)?;
+            let mut spans = Vec::new();
+            for i in 0..found.Length()? {
+                let r = found.GetElement(i)?.CurrentBoundingRectangle()?;
+                if r.right <= r.left {
+                    continue; // off-screen/virtualized
+                }
+                if notify.is_some_and(|n| r.left >= n.left && r.right <= n.right) {
+                    continue;
+                }
+                spans.push((r.left, r.right));
+            }
+            Ok(spans)
+        }
+    };
+    let mut spans: Vec<(i32, i32)> = roots.into_iter().flat_map(|h| scan(h).unwrap_or_default()).collect();
+    spans.sort_unstable();
+    spans.dedup();
+    spans
+}
+
+/// Rescans the taskbar's buttons every 10 s (only while the taskbar is shown) on a background thread.
+pub fn spawn_scanner(shared: std::sync::Arc<std::sync::Mutex<Vec<(i32, i32)>>>) {
+    use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
+    std::thread::spawn(move || {
+        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        loop {
+            // Nothing to avoid while an auto-hide taskbar is tucked away.
+            if let Some(geo) = query_geometry() {
+                let spans = occupied_spans(geo.tb_hwnd, geo.notify);
+                if let Ok(mut guard) = shared.lock() {
+                    *guard = spans;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(10));
+        }
+    });
+}
+
 struct Geometry {
     tb_hwnd: HWND,
     tb: RECT,
@@ -117,8 +191,8 @@ pub struct StripWindow {
     bitmap: Option<Bitmap>,
     rendered_for: Option<(u32, i32)>, // (dpi, taskbar height)
     last_rect: Option<RECT>,
-    /// Extra spans (x ranges) the strip must not cover; filled by Task 8's scanner.
-    pub occupied: Vec<(i32, i32)>,
+    /// Taskbar button spans the strip must not cover; refreshed by `spawn_scanner`.
+    occupied: std::sync::Arc<std::sync::Mutex<Vec<(i32, i32)>>>,
 }
 
 unsafe extern "system" fn strip_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -171,7 +245,11 @@ impl StripWindow {
                 bitmap: None,
                 rendered_for: None,
                 last_rect: None,
-                occupied: Vec::new(),
+                occupied: {
+                    let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                    spawn_scanner(shared.clone());
+                    shared
+                },
             })
         }
     }
@@ -222,7 +300,8 @@ impl StripWindow {
             return self.hide();
         };
         let target = compute_strip_rect(geo.tb, geo.notify, bmp.width, bmp.height, geo.dpi);
-        if self.occupied.iter().any(|&(l, r)| target.left < r && target.right > l) {
+        let covered = self.occupied.lock().map(|spans| overlaps(target, &spans)).unwrap_or(false);
+        if covered {
             return self.hide();
         }
         unsafe {
@@ -293,6 +372,16 @@ mod tests {
         assert_eq!((r.left, r.right), (4, 5004));
     }
 
+    #[test]
+    fn overlap_rules() {
+        let strip = RECT { left: 100, top: 0, right: 200, bottom: 48 };
+        assert!(!overlaps(strip, &[(50, 99)]));
+        assert!(overlaps(strip, &[(150, 160)]));
+        assert!(!overlaps(strip, &[(200, 300)]));
+        assert!(overlaps(strip, &[(10, 20), (190, 250)]));
+        assert!(!overlaps(strip, &[]));
+    }
+
     const MONITOR: RECT = RECT { left: 0, top: 0, right: 1920, bottom: 1080 };
 
     #[test]
@@ -316,5 +405,26 @@ mod tests {
     #[test]
     fn dpi_150() {
         assert_eq!(compute_strip_rect(TB, Some(NOTIFY), 200, 48, 144).right, 1688);
+    }
+}
+
+#[cfg(test)]
+mod live {
+    use super::*;
+
+    /// Needs a real Windows 11 taskbar with at least one app button.
+    #[test]
+    #[ignore]
+    fn scan_finds_app_buttons() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+            let tb = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()).unwrap();
+            let notify = find_child_rect(tb, w!("TrayNotifyWnd"));
+            let t = std::time::Instant::now();
+            let spans = occupied_spans(tb, notify);
+            println!("spans={spans:?} in {:?}", t.elapsed());
+            assert!(!spans.is_empty());
+            assert!(spans.iter().all(|&(_, r)| notify.is_none_or(|n| r <= n.left)), "tray buttons excluded");
+        }
     }
 }
