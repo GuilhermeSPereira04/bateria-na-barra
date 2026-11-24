@@ -81,6 +81,17 @@ fn class_name(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..n.max(0) as usize])
 }
 
+/// Fullscreen = covers the whole monitor without a title bar (games, F11, video
+/// players). Maximized windows keep `WS_CAPTION`, and with an auto-hide taskbar
+/// they also cover the whole monitor, so the caption is what tells them apart.
+fn is_fullscreen(rect: RECT, style: u32, monitor: RECT) -> bool {
+    let covers = rect.left <= monitor.left
+        && rect.top <= monitor.top
+        && rect.right >= monitor.right
+        && rect.bottom >= monitor.bottom;
+    covers && style & WS_CAPTION.0 != WS_CAPTION.0
+}
+
 /// True when the foreground window (not the shell, not us) covers the whole monitor.
 fn foreground_is_fullscreen(own: HWND, monitor: RECT) -> bool {
     unsafe {
@@ -95,7 +106,7 @@ fn foreground_is_fullscreen(own: HWND, monitor: RECT) -> bool {
         if GetWindowRect(fg, &mut r).is_err() {
             return false;
         }
-        r.left <= monitor.left && r.top <= monitor.top && r.right >= monitor.right && r.bottom >= monitor.bottom
+        is_fullscreen(r, GetWindowLongW(fg, GWL_STYLE) as u32, monitor)
     }
 }
 
@@ -280,6 +291,26 @@ mod tests {
     fn clamped_left() {
         let r = compute_strip_rect(TB, Some(NOTIFY), 5000, 48, 96);
         assert_eq!((r.left, r.right), (4, 5004));
+    }
+
+    const MONITOR: RECT = RECT { left: 0, top: 0, right: 1920, bottom: 1080 };
+
+    #[test]
+    fn maximized_window_with_caption_is_not_fullscreen() {
+        // A maximized Chrome with an auto-hide taskbar covers the whole monitor.
+        let rect = RECT { left: -8, top: -8, right: 1928, bottom: 1088 };
+        assert!(!is_fullscreen(rect, 0x17CF_0000, MONITOR));
+    }
+
+    #[test]
+    fn borderless_window_covering_monitor_is_fullscreen() {
+        assert!(is_fullscreen(MONITOR, 0x9000_0000, MONITOR)); // WS_POPUP | WS_VISIBLE
+    }
+
+    #[test]
+    fn smaller_borderless_window_is_not_fullscreen() {
+        let rect = RECT { left: 0, top: 0, right: 1280, bottom: 720 };
+        assert!(!is_fullscreen(rect, 0x9000_0000, MONITOR));
     }
 
     #[test]

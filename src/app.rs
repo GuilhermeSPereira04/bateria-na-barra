@@ -1,0 +1,219 @@
+//! The hidden owner window: holds all state and reacts to readers, timers,
+//! clicks and shell broadcasts.
+use std::cell::RefCell;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::Instant;
+
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
+use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::core::{PCWSTR, w};
+
+use crate::model::{ALL, DeviceKind, ReadOutcome, Tracker};
+use crate::readers::{self, WM_READING};
+use crate::render::Strip;
+use crate::taskbar::{StripWindow, WM_STRIP_CLICK};
+use crate::tray::{self, Tray, WM_TRAY};
+use crate::{startup, theme};
+
+const TIMER_SYNC: usize = 1; // 1 s: keep the strip placed and on top
+/// Posted by the WinEvent hook when the taskbar moves (auto-hide slide, resize).
+const WM_TASKBAR_MOVED: u32 = WM_APP + 5;
+
+static OWNER: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static TASKBAR: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+unsafe extern "system" fn on_location_change(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    hwnd: HWND,
+    id_object: i32,
+    _id_child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if id_object == OBJID_WINDOW.0 && hwnd.0 as isize == TASKBAR.load(Relaxed) {
+        let owner = HWND(OWNER.load(Relaxed) as _);
+        let _ = unsafe { PostMessageW(Some(owner), WM_TASKBAR_MOVED, WPARAM(0), LPARAM(0)) };
+    }
+}
+
+/// Watches the taskbar's position so the strip follows auto-hide immediately
+/// instead of waiting for the 1 s timer. Re-run after Explorer restarts.
+fn hook_taskbar_moves(previous: Option<HWINEVENTHOOK>) -> Option<HWINEVENTHOOK> {
+    use std::sync::atomic::Ordering::Relaxed;
+    unsafe {
+        if let Some(h) = previous {
+            let _ = UnhookWinEvent(h);
+        }
+        let tb = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()).ok()?;
+        TASKBAR.store(tb.0 as isize, Relaxed);
+        let mut pid = 0u32;
+        let thread = GetWindowThreadProcessId(tb, Some(&mut pid));
+        let hook = SetWinEventHook(
+            EVENT_OBJECT_LOCATIONCHANGE,
+            EVENT_OBJECT_LOCATIONCHANGE,
+            None,
+            Some(on_location_change),
+            pid,
+            thread,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        );
+        (!hook.is_invalid()).then_some(hook)
+    }
+}
+const TIMER_EXPIRE: usize = 2; // 60 s: let held values expire
+const TRAY_GLYPH: char = '\u{E83F}';
+const TRAY_ICON_PX: i32 = 32;
+
+struct App {
+    tracker: Tracker,
+    strip: StripWindow,
+    tray: Tray,
+    rx: Receiver<(DeviceKind, ReadOutcome)>,
+    refresh: Vec<Sender<()>>,
+    taskbar_created: u32,
+    dark: bool,
+    hook: Option<HWINEVENTHOOK>,
+}
+
+thread_local! {
+    static APP: RefCell<Option<App>> = const { RefCell::new(None) };
+}
+
+impl App {
+    fn rebuild(&mut self) {
+        let now = Instant::now();
+        let items = ALL.iter().map(|&k| (k, self.tracker.view(k, now))).collect();
+        self.strip.set_strip(Strip { items, dark: self.dark });
+        self.tray.set_tip(&self.tracker.tooltip(now));
+    }
+
+    fn menu(&mut self, hwnd: HWND) {
+        match tray::show_menu(hwnd, startup::is_enabled()) {
+            tray::CMD_REFRESH => {
+                for r in &self.refresh {
+                    let _ = r.send(());
+                }
+            }
+            tray::CMD_STARTUP => {
+                let _ = startup::set_enabled(!startup::is_enabled());
+            }
+            tray::CMD_QUIT => unsafe {
+                let _ = DestroyWindow(hwnd);
+            },
+            _ => {}
+        }
+    }
+}
+
+fn with_app(f: impl FnOnce(&mut App)) {
+    // Menus run a nested message loop; skip re-entrant messages instead of panicking.
+    APP.with(|cell| {
+        if let Ok(mut guard) = cell.try_borrow_mut()
+            && let Some(app) = guard.as_mut()
+        {
+            f(app);
+        }
+    });
+}
+
+fn is_click(msg: u32) -> bool {
+    msg == WM_LBUTTONUP || msg == WM_RBUTTONUP
+}
+
+unsafe extern "system" fn owner_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_READING => with_app(|app| {
+            let now = Instant::now();
+            while let Ok((kind, outcome)) = app.rx.try_recv() {
+                app.tracker.update(kind, outcome, now);
+            }
+            app.rebuild();
+        }),
+        WM_TIMER if wp.0 == TIMER_SYNC => with_app(|app| app.strip.sync()),
+        WM_TIMER if wp.0 == TIMER_EXPIRE => with_app(|app| app.rebuild()),
+        WM_STRIP_CLICK => with_app(|app| app.menu(hwnd)),
+        WM_TRAY if is_click(lp.0 as u32) => with_app(|app| app.menu(hwnd)),
+        WM_SETTINGCHANGE => {
+            let what = if lp.0 != 0 { unsafe { PCWSTR(lp.0 as _).to_string().unwrap_or_default() } } else { String::new() };
+            if what == "ImmersiveColorSet" {
+                with_app(|app| {
+                    app.dark = theme::taskbar_is_dark();
+                    let icon = app.strip.renderer().render_glyph_icon(TRAY_GLYPH, app.dark, TRAY_ICON_PX);
+                    app.tray.set_icon(icon);
+                    app.rebuild();
+                });
+            }
+        }
+        WM_TASKBAR_MOVED => with_app(|app| app.strip.sync()),
+        WM_DISPLAYCHANGE | WM_DPICHANGED => with_app(|app| {
+            app.strip.invalidate();
+            app.strip.sync();
+        }),
+        WM_DESTROY => {
+            APP.with(|cell| cell.borrow_mut().take()); // drops the tray icon
+            unsafe { PostQuitMessage(0) };
+        }
+        m if m != 0 && APP.with(|c| c.try_borrow().ok().and_then(|a| a.as_ref().map(|a| a.taskbar_created))) == Some(m) => {
+            with_app(|app| {
+                app.tray.readd();
+                app.hook = hook_taskbar_moves(app.hook.take());
+                app.strip.invalidate();
+                app.strip.sync();
+            });
+        }
+        _ => return unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    }
+    LRESULT(0)
+}
+
+pub fn run() -> windows::core::Result<()> {
+    unsafe {
+        let hinstance = GetModuleHandleW(None)?;
+        let class = w!("BatteryBarOwner");
+        let wc = WNDCLASSW { lpfnWndProc: Some(owner_proc), hInstance: hinstance.into(), lpszClassName: class, ..Default::default() };
+        RegisterClassW(&wc);
+        // A real (invisible) top-level window: message-only windows miss shell broadcasts.
+        let hwnd = CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            class,
+            w!("battery-bar"),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            Some(hinstance.into()),
+            None,
+        )?;
+
+        let strip = StripWindow::create(hwnd)?;
+        let dark = theme::taskbar_is_dark();
+        let tray = Tray::new(hwnd, strip.renderer().render_glyph_icon(TRAY_GLYPH, dark, TRAY_ICON_PX));
+        let (tx, rx) = mpsc::channel();
+        let refresh = readers::spawn_all(hwnd.0 as isize, tx);
+        let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
+        OWNER.store(hwnd.0 as isize, std::sync::atomic::Ordering::Relaxed);
+        let hook = hook_taskbar_moves(None);
+        APP.with(|cell| {
+            *cell.borrow_mut() =
+                Some(App { tracker: Tracker::new(), strip, tray, rx, refresh, taskbar_created, dark, hook });
+        });
+        with_app(|app| app.rebuild());
+
+        SetTimer(Some(hwnd), TIMER_SYNC, 1000, None);
+        SetTimer(Some(hwnd), TIMER_EXPIRE, 60_000, None);
+
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    Ok(())
+}
