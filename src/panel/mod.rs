@@ -40,6 +40,8 @@ pub const WM_PANEL_ASYNC: u32 = WM_APP + 10;
 pub const ASYNC_APPS: usize = 1;
 /// `WM_PANEL_ASYNC` source: the Wi-Fi and Bluetooth state.
 pub const ASYNC_RADIOS: usize = 2;
+/// `WM_PANEL_ASYNC` source: what is playing.
+pub const ASYNC_MEDIA: usize = 3;
 /// `WM_PANEL_ASYNC` source: the audio outputs and the default one's state.
 pub const ASYNC_AUDIO: usize = 5;
 /// Posted to the owner when the panel wants to close itself (Esc, click

@@ -15,12 +15,13 @@ use windows::core::{PCWSTR, w};
 use crate::apps::{self, AppEntry, Catalog};
 use crate::audio::{self, AudioSnapshot};
 use crate::config::{self, Accent, Colors, Config, GlassTint};
+use crate::media::{self, MediaCmd, NowPlaying};
 use crate::model::{ALL, DeviceKind, ReadOutcome, Tracker};
 use crate::panel::trigger::{CloseRule, EdgeTrigger, Pauses};
 use crate::panel::layout::MAX_ROWS;
 use crate::panel::view::{Hit, Key, PanelView, QuickState, Tab, Toggle};
 use crate::panel::{
-    ASYNC_APPS, ASYNC_AUDIO, ASYNC_RADIOS, PanelWindow, WM_PANEL_ASYNC, WM_PANEL_CLOSED, WM_PANEL_HIT, WM_PANEL_KEY, WM_PANEL_WHEEL,
+    ASYNC_APPS, ASYNC_AUDIO, ASYNC_MEDIA, ASYNC_RADIOS, PanelWindow, WM_PANEL_ASYNC, WM_PANEL_CLOSED, WM_PANEL_HIT, WM_PANEL_KEY, WM_PANEL_WHEEL,
 };
 use crate::readers::{self, WM_READING};
 use crate::radios::{self, RadioKind, RadioSnapshot};
@@ -80,7 +81,8 @@ fn hook_taskbar_moves(previous: Option<HWINEVENTHOOK>) -> Option<HWINEVENTHOOK> 
 }
 const TIMER_EXPIRE: usize = 2; // 60 s: let held values expire
 const TIMER_EDGE: usize = 3; // 100 ms: watch the top edge and the open panel
-// Reserved for the panel: TIMER_STATS = 4, TIMER_MEDIA = 5.
+// Reserved for the panel: TIMER_STATS = 4.
+const TIMER_MEDIA: usize = 5; // 2 s while the panel is open: read what is playing
 const TRAY_GLYPH: char = '\u{E83F}';
 const TRAY_ICON_PX: i32 = 32;
 /// Volume change per wheel notch over the audio toggle, in percentage points.
@@ -119,6 +121,9 @@ struct App {
     audio_list_open: bool,
     audio_rx: Option<Receiver<AudioSnapshot>>,
     audio_touched: bool,
+    /// What is playing (last read) and the pending read (panel open only).
+    media: Option<NowPlaying>,
+    media_rx: Option<Receiver<Option<NowPlaying>>>,
 }
 
 thread_local! {
@@ -173,7 +178,42 @@ impl App {
             self.apps_rx = Some(apps::enumerate_async(hwnd));
             self.radios_rx = Some(radios::spawn(hwnd, || {}));
             self.read_audio(hwnd);
+            self.read_media(hwnd, None);
+            unsafe { SetTimer(Some(hwnd), TIMER_MEDIA, 2000, None) };
         }
+    }
+
+    /// Sends `cmd` if any, then reads what is playing, on a worker thread.
+    fn read_media(&mut self, hwnd: HWND, cmd: Option<MediaCmd>) {
+        // Replacing the receiver discards a read still in flight.
+        self.media_rx = Some(media::spawn(hwnd, cmd, self.media.clone()));
+    }
+
+    /// Every `TIMER_MEDIA` tick; skipped while a read is still pending.
+    fn media_tick(&mut self, hwnd: HWND) {
+        if self.panel.is_some() && self.media_rx.is_none() {
+            self.read_media(hwnd, None);
+        }
+    }
+
+    /// What is playing arrived from its worker thread.
+    fn on_media(&mut self) {
+        let Some(now) = self.media_rx.as_ref().and_then(|rx| rx.try_recv().ok()) else { return };
+        self.media_rx = None;
+        if self.media != now {
+            self.media = now;
+            self.refresh_panel();
+        }
+    }
+
+    /// A player button: only with something playing.
+    fn media_command(&mut self, hwnd: HWND, cmd: MediaCmd) {
+        let Some(now) = self.media.as_mut() else { return };
+        if cmd == MediaCmd::PlayPause {
+            now.playing = !now.playing; // shown now; the read confirms it
+            self.refresh_panel();
+        }
+        self.read_media(hwnd, Some(cmd));
     }
 
     /// Reads the outputs and the default one's state on a worker thread.
@@ -322,6 +362,7 @@ impl App {
             results: self.results.clone(),
             selected: self.selected,
             quick: self.quick.clone(),
+            media: self.media.clone(),
             audio_list: self.audio_list_open.then(|| self.audio_outputs.iter().map(|(_, name)| name.clone()).collect()),
             ..Default::default()
         }
@@ -356,6 +397,9 @@ impl App {
             }
             Hit::AudioDevice(i) => return self.pick_output(hwnd, i),
             Hit::AudioSettings => return self.open_settings("ms-settings:sound"),
+            Hit::MediaPrev => return self.media_command(hwnd, MediaCmd::Prev),
+            Hit::MediaPlay => return self.media_command(hwnd, MediaCmd::PlayPause),
+            Hit::MediaNext => return self.media_command(hwnd, MediaCmd::Next),
             Hit::Tab(tab) => self.tab = tab,
             Hit::Gear => self.gear_open = !self.gear_open,
             Hit::Accent(i) if i < config::ACCENTS.len() => self.set_config(Config { accent: Accent::Preset(i), ..self.config }),
@@ -384,6 +428,9 @@ impl App {
         self.apps_rx = None;
         self.radios_rx = None;
         self.audio_rx = None;
+        self.media_rx = None;
+        let owner = HWND(OWNER.load(std::sync::atomic::Ordering::Relaxed) as _);
+        let _ = unsafe { KillTimer(Some(owner), TIMER_MEDIA) };
         self.audio_list_open = false;
         self.results = Vec::new();
         self.query = String::new();
@@ -454,6 +501,7 @@ unsafe extern "system" fn owner_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         WM_TIMER if wp.0 == TIMER_SYNC => with_app(|app| app.strip.sync()),
         WM_TIMER if wp.0 == TIMER_EXPIRE => with_app(|app| app.rebuild()),
         WM_TIMER if wp.0 == TIMER_EDGE => with_app(|app| app.edge_tick(hwnd)),
+        WM_TIMER if wp.0 == TIMER_MEDIA => with_app(|app| app.media_tick(hwnd)),
         // Ignore a late request from a panel that is already gone.
         WM_PANEL_CLOSED => with_app(|app| {
             if app.panel.as_ref().is_some_and(|p| p.hwnd().0 as usize == wp.0) {
@@ -481,6 +529,7 @@ unsafe extern "system" fn owner_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         WM_PANEL_ASYNC if wp.0 == ASYNC_APPS => with_app(|app| app.on_apps()),
         WM_PANEL_ASYNC if wp.0 == ASYNC_RADIOS => with_app(|app| app.on_radios()),
         WM_PANEL_ASYNC if wp.0 == ASYNC_AUDIO => with_app(|app| app.on_audio()),
+        WM_PANEL_ASYNC if wp.0 == ASYNC_MEDIA => with_app(|app| app.on_media()),
         WM_PANEL_WHEEL => with_app(|app| {
             let notches = app.panel.as_ref().map(|p| p.take_wheel()).unwrap_or(0);
             if notches != 0 {
@@ -597,6 +646,8 @@ pub fn run() -> windows::core::Result<()> {
                 audio_list_open: false,
                 audio_rx: None,
                 audio_touched: false,
+                media: None,
+                media_rx: None,
             });
         });
         with_app(|app| app.rebuild());

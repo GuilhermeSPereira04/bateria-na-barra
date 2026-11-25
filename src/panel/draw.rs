@@ -8,8 +8,9 @@ use windows_numerics::Vector2;
 
 use super::layout::{INSET, Layout, MAX_ROWS, ROW_H, scale};
 use super::view::{Hit, PanelView, Tab, Toggle};
-use crate::apps::{AppEntry, Icon};
+use crate::apps::AppEntry;
 use crate::config::{ACCENTS, Accent, Colors, GlassTint};
+use crate::media::COVER_PX;
 use crate::model::ItemView;
 use crate::render::{BOLT, ICON_FONT, TEXT_FONT, device_glyph, item_style, rgb};
 use crate::speedtest::{Phase, SpeedState};
@@ -20,6 +21,9 @@ const SELECTED: f32 = 0.10;
 const RADIUS: f32 = 8.0;
 /// Result icons, in DIP.
 const ICON: f32 = 20.0;
+/// The media cover and its distance from the card's left edge, in DIP.
+const COVER: f32 = 32.0;
+const COVER_INSET: f32 = 6.0;
 const TEXT: u32 = 0xFFFFFF;
 const ERROR: u32 = 0xFF6B5E;
 /// Text over an accent fill (accents are light colors).
@@ -42,14 +46,16 @@ const GLYPH_RIGHT: char = '\u{E76C}';
 const MONTHS: [&str; 12] =
     ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"];
 
-/// Text formats (per DPI), the brush and the result icons (per render
-/// target), kept between paints.
+/// Text formats (per DPI), the brush, the result icons and the media cover
+/// (per render target), kept between paints.
 pub struct Cache {
     dpi: u32,
     fonts: Option<Fonts>,
     brush: Option<ID2D1SolidColorBrush>,
     /// Bitmaps of the results' icons, by app id.
     icons: Vec<(String, ID2D1Bitmap)>,
+    /// The media cover's bitmap and the pixels it was made from.
+    cover: Option<(Vec<u8>, ID2D1Bitmap)>,
 }
 
 struct Fonts {
@@ -63,13 +69,25 @@ struct Fonts {
 
 impl Cache {
     pub fn new() -> Self {
-        Self { dpi: 0, fonts: None, brush: None, icons: Vec::new() }
+        Self { dpi: 0, fonts: None, brush: None, icons: Vec::new(), cover: None }
     }
 
     /// Forgets what belongs to a render target that is being replaced.
     pub fn reset_target(&mut self) {
         self.brush = None;
         self.icons.clear();
+        self.cover = None;
+    }
+
+    /// Re-creates the cover's bitmap only when its pixels change.
+    fn sync_cover(&mut self, rt: &ID2D1RenderTarget, cover: Option<&Vec<u8>>) {
+        match cover {
+            Some(px) if self.cover.as_ref().is_some_and(|(kept, _)| kept == px) => {}
+            Some(px) if px.len() == (COVER_PX * COVER_PX * 4) as usize => {
+                self.cover = bitmap(rt, COVER_PX, px).ok().map(|bmp| (px.clone(), bmp));
+            }
+            _ => self.cover = None,
+        }
     }
 
     /// Keeps bitmaps for exactly the visible results that have an icon.
@@ -81,21 +99,22 @@ impl Cache {
             if self.icons.iter().any(|(id, _)| id == &app.id) {
                 continue;
             }
-            if let Ok(bmp) = bitmap(rt, icon) {
+            if let Ok(bmp) = bitmap(rt, icon.size, &icon.bgra) {
                 self.icons.push((app.id.clone(), bmp));
             }
         }
     }
 }
 
-fn bitmap(rt: &ID2D1RenderTarget, icon: &Icon) -> windows::core::Result<ID2D1Bitmap> {
+/// A `side` x `side` bitmap from premultiplied BGRA pixels.
+fn bitmap(rt: &ID2D1RenderTarget, side: u32, bgra: &[u8]) -> windows::core::Result<ID2D1Bitmap> {
     let props = D2D1_BITMAP_PROPERTIES {
         pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
         dpiX: 96.0,
         dpiY: 96.0,
     };
-    let size = D2D_SIZE_U { width: icon.size, height: icon.size };
-    unsafe { rt.CreateBitmap(size, Some(icon.bgra.as_ptr() as _), icon.size * 4, &props) }
+    let size = D2D_SIZE_U { width: side, height: side };
+    unsafe { rt.CreateBitmap(size, Some(bgra.as_ptr() as _), side * 4, &props) }
 }
 
 fn format(dw: &IDWriteFactory, family: PCWSTR, weight: DWRITE_FONT_WEIGHT, size: f32) -> windows::core::Result<IDWriteTextFormat> {
@@ -139,6 +158,7 @@ struct Painter<'a> {
     f: &'a Fonts,
     s: f32,
     icons: &'a [(String, ID2D1Bitmap)],
+    cover: Option<&'a ID2D1Bitmap>,
 }
 
 fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
@@ -221,8 +241,10 @@ pub fn draw(rt: &ID2D1RenderTarget, dw: &IDWriteFactory, cache: &mut Cache, view
     }
     let shown: &[AppEntry] = if view.query.is_empty() { &[] } else { &view.results };
     cache.sync_icons(rt, shown);
+    cache.sync_cover(rt, view.media.as_ref().and_then(|m| m.cover.as_ref()));
     let (Some(f), Some(brush)) = (&cache.fonts, &cache.brush) else { return Ok(()) };
-    let p = Painter { rt, dw, brush, f, s, icons: &cache.icons };
+    let cover = cache.cover.as_ref().map(|(_, bmp)| bmp);
+    let p = Painter { rt, dw, brush, f, s, icons: &cache.icons, cover };
     // ClearType can't blend onto transparent pixels.
     unsafe { rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE) };
 
@@ -382,7 +404,14 @@ fn media(p: &Painter, view: &PanelView, l: &Layout) {
     let r = l.media;
     p.fill(r, white(CARD));
     let end = l.rect(Hit::MediaPrev).map_or(r.right, |b| b.left) - p.px(8.0);
-    let left = r.left + p.px(12.0);
+    let mut left = r.left + p.px(12.0);
+    if let (Some(bmp), Some(_)) = (p.cover, &view.media) {
+        let (size, x) = (p.px(COVER), r.left + p.px(COVER_INSET));
+        let y = (r.top + r.bottom - size) / 2.0;
+        let dest = rect(x, y, x + size, y + size);
+        unsafe { p.rt.DrawBitmap(bmp, Some(&dest), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None) };
+        left = dest.right + p.px(10.0);
+    }
     let (playing, alpha) = match &view.media {
         Some(np) => {
             let w = p.measure(&np.title, &p.f.bold).min(end - left);
@@ -398,12 +427,16 @@ fn media(p: &Painter, view: &PanelView, l: &Layout) {
             (false, UNAVAILABLE)
         }
     };
-    let play = if playing { GLYPH_PAUSE } else { GLYPH_PLAY };
-    for (hit, g) in [(Hit::MediaPrev, GLYPH_PREV), (Hit::MediaPlay, play), (Hit::MediaNext, GLYPH_NEXT)] {
+    for (hit, g) in [(Hit::MediaPrev, GLYPH_PREV), (Hit::MediaPlay, play_glyph(playing)), (Hit::MediaNext, GLYPH_NEXT)] {
         if let Some(b) = l.rect(hit) {
             p.glyph(g, &p.f.icon, b, white(alpha));
         }
     }
+}
+
+/// Pause while playing, play otherwise.
+fn play_glyph(playing: bool) -> char {
+    if playing { GLYPH_PAUSE } else { GLYPH_PLAY }
 }
 
 fn lower(p: &Painter, view: &PanelView, l: &Layout) {
@@ -601,16 +634,15 @@ fn speed(p: &Painter, view: &PanelView, l: &Layout) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::apps::Icon;
     use crate::media::NowPlaying;
     use crate::model::{Charge, DeviceKind, Reading};
     use crate::panel::layout::layout;
     use crate::render::Bitmap;
     use crate::sysinfo::{ProcRow, Stats};
 
-    /// Draws `view` into a software target; returns the BGRA pixels.
-    fn render(view: &PanelView, cache: &mut Cache) -> (Bitmap, windows::core::Result<()>) {
-        let l = layout(view);
-        let bmp = Bitmap::new(l.size.0 as i32, l.size.1 as i32).unwrap();
+    /// A software target bound to `bmp`.
+    fn target(bmp: &Bitmap) -> ID2D1RenderTarget {
         let props = D2D1_RENDER_TARGET_PROPERTIES {
             r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
             pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
@@ -621,10 +653,20 @@ mod tests {
         };
         unsafe {
             let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).unwrap();
-            let dw: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).unwrap();
             let rt = d2d.CreateDCRenderTarget(&props).unwrap();
             let rc = windows::Win32::Foundation::RECT { left: 0, top: 0, right: bmp.width, bottom: bmp.height };
             rt.BindDC(bmp.dc, &rc).unwrap();
+            rt.into()
+        }
+    }
+
+    /// Draws `view` into a software target; returns the BGRA pixels.
+    fn render(view: &PanelView, cache: &mut Cache) -> (Bitmap, windows::core::Result<()>) {
+        let l = layout(view);
+        let bmp = Bitmap::new(l.size.0 as i32, l.size.1 as i32).unwrap();
+        let rt = target(&bmp);
+        unsafe {
+            let dw: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).unwrap();
             rt.BeginDraw();
             rt.Clear(Some(&rgb(0, 0.0)));
             let drawn = draw(&rt, &dw, cache, view, &l);
@@ -696,6 +738,45 @@ mod tests {
         drawn.unwrap();
         let px = &bmp.pixels()[((y * bmp.width + x) * 4) as usize..][..4];
         assert_eq!(px, [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn play_glyph_follows_playing() {
+        assert_eq!(play_glyph(true), GLYPH_PAUSE);
+        assert_eq!(play_glyph(false), GLYPH_PLAY);
+    }
+
+    #[test]
+    fn cover_is_drawn() {
+        // An opaque white cover lands at the left of the media card.
+        let cover = vec![255; (COVER_PX * COVER_PX * 4) as usize];
+        let media = NowPlaying { title: "Kick Back".into(), artist: "Kenshi Yonezu".into(), playing: false, cover: Some(cover) };
+        let view = PanelView { media: Some(media), ..full_view(96) };
+        let r = layout(&view).media;
+        let (x, y) = ((r.left + COVER_INSET + COVER / 2.0) as i32, ((r.top + r.bottom) / 2.0) as i32);
+        let mut cache = Cache::new();
+        let (bmp, drawn) = render(&view, &mut cache);
+        drawn.unwrap();
+        let px = &bmp.pixels()[((y * bmp.width + x) * 4) as usize..][..4];
+        assert_eq!(px, [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn cover_bitmap_is_kept_while_the_cover_is_the_same() {
+        let bmp = Bitmap::new(8, 8).unwrap();
+        let rt = target(&bmp);
+        let mut cache = Cache::new();
+        let a = vec![255; (COVER_PX * COVER_PX * 4) as usize];
+        let raw = |c: &Cache| c.cover.as_ref().map(|(_, b)| windows::core::Interface::as_raw(b));
+        cache.sync_cover(&rt, Some(&a));
+        let first = raw(&cache);
+        assert!(first.is_some());
+        cache.sync_cover(&rt, Some(&a.clone()));
+        assert_eq!(raw(&cache), first);
+        cache.sync_cover(&rt, Some(&vec![0; a.len()]));
+        assert!(raw(&cache).is_some() && raw(&cache) != first);
+        cache.sync_cover(&rt, None);
+        assert!(cache.cover.is_none());
     }
 
     #[test]
