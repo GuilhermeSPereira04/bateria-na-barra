@@ -42,6 +42,8 @@ pub const ASYNC_APPS: usize = 1;
 pub const ASYNC_RADIOS: usize = 2;
 /// `WM_PANEL_ASYNC` source: what is playing.
 pub const ASYNC_MEDIA: usize = 3;
+/// `WM_PANEL_ASYNC` source: speed test progress or outcome.
+pub const ASYNC_SPEED: usize = 4;
 /// `WM_PANEL_ASYNC` source: the audio outputs and the default one's state.
 pub const ASYNC_AUDIO: usize = 5;
 /// `WM_PANEL_ASYNC` source: a CPU/GPU/RAM sample for the Resources tab.

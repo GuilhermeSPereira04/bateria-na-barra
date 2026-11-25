@@ -1,6 +1,8 @@
 //! The hidden owner window: holds all state and reacts to readers, timers,
 //! clicks and shell broadcasts.
 use std::cell::RefCell;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 
@@ -22,11 +24,12 @@ use crate::panel::trigger::{CloseRule, EdgeTrigger, Pauses};
 use crate::panel::layout::MAX_ROWS;
 use crate::panel::view::{Hit, Key, PanelView, QuickState, Tab, Toggle};
 use crate::panel::{
-    ASYNC_APPS, ASYNC_AUDIO, ASYNC_MEDIA, ASYNC_RADIOS, ASYNC_STATS, PanelWindow, WM_PANEL_ASYNC, WM_PANEL_CLOSED, WM_PANEL_HIT, WM_PANEL_KEY, WM_PANEL_WHEEL,
+    ASYNC_APPS, ASYNC_AUDIO, ASYNC_MEDIA, ASYNC_RADIOS, ASYNC_SPEED, ASYNC_STATS, PanelWindow, WM_PANEL_ASYNC, WM_PANEL_CLOSED, WM_PANEL_HIT, WM_PANEL_KEY, WM_PANEL_WHEEL,
 };
 use crate::readers::{self, WM_READING};
 use crate::radios::{self, RadioKind, RadioSnapshot};
 use crate::render::Strip;
+use crate::speedtest::{self, SpeedState};
 use crate::sysinfo::{Stats, StatsWorker};
 use crate::taskbar::{StripWindow, WM_STRIP_CLICK};
 use crate::tray::{self, Tray, WM_TRAY};
@@ -139,6 +142,13 @@ struct App {
     stats: Option<Stats>,
     sort_ram: bool,
     sampler: Option<StatsWorker>,
+    /// Speed test: what the tab shows (kept until the process exits), what
+    /// it showed before the running test (restored if that one is
+    /// cancelled), and the running test's reports and cancel flag.
+    speed: SpeedState,
+    speed_before: SpeedState,
+    speed_rx: Option<Receiver<SpeedState>>,
+    speed_cancel: Option<Arc<AtomicBool>>,
 }
 
 thread_local! {
@@ -228,6 +238,42 @@ impl App {
         let Some(stats) = self.sampler.as_mut().and_then(|s| s.take()) else { return };
         self.stats = Some(stats);
         self.refresh_panel();
+    }
+
+    /// The `Testar` button: starts a test unless one is running.
+    fn start_speed(&mut self, hwnd: HWND) {
+        if matches!(self.speed, SpeedState::Running { .. }) {
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        speedtest::start(hwnd.0 as isize, cancel.clone(), tx);
+        let running = SpeedState::Running { phase: speedtest::Phase::Ping, ping_ms: None, down: None, up: None };
+        self.speed_before = std::mem::replace(&mut self.speed, running);
+        self.speed_rx = Some(rx);
+        self.speed_cancel = Some(cancel);
+    }
+
+    /// Progress or the outcome arrived from the speed test thread.
+    fn on_speed(&mut self) {
+        let Some(state) = self.speed_rx.as_ref().and_then(|rx| rx.try_iter().last()) else { return };
+        if !matches!(state, SpeedState::Running { .. }) {
+            self.speed_rx = None;
+            self.speed_cancel = None;
+        }
+        self.speed = state;
+        self.refresh_panel();
+    }
+
+    /// Cancels a running test; the tab goes back to what it showed before.
+    fn stop_speed(&mut self) {
+        if let Some(cancel) = self.speed_cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.speed_rx = None;
+        if matches!(self.speed, SpeedState::Running { .. }) {
+            self.speed = std::mem::take(&mut self.speed_before);
+        }
     }
 
     /// Sends `cmd` if any, then reads what is playing, on a worker thread.
@@ -414,6 +460,7 @@ impl App {
             media: self.media.clone(),
             stats: self.stats.as_ref().map(|s| s.ranked(self.sort_ram, 5)),
             sort_ram: self.sort_ram,
+            speed: self.speed.clone(),
             audio_list: self.audio_list_open.then(|| self.audio_outputs.iter().map(|(_, name)| name.clone()).collect()),
             ..Default::default()
         }
@@ -459,6 +506,7 @@ impl App {
             Hit::CalNext => self.month = calendar::shift(self.month, 1),
             Hit::SortCpu => self.sort_ram = false,
             Hit::SortRam => self.sort_ram = true,
+            Hit::SpeedStart => self.start_speed(hwnd),
             Hit::Gear => self.gear_open = !self.gear_open,
             Hit::Accent(i) if i < config::ACCENTS.len() => self.set_config(Config { accent: Accent::Preset(i), ..self.config }),
             Hit::AccentWindows => self.set_config(Config { accent: Accent::Windows, ..self.config }),
@@ -487,6 +535,7 @@ impl App {
         self.radios_rx = None;
         self.audio_rx = None;
         self.media_rx = None;
+        self.stop_speed();
         let owner = HWND(OWNER.load(std::sync::atomic::Ordering::Relaxed) as _);
         let _ = unsafe { KillTimer(Some(owner), TIMER_MEDIA) };
         self.sync_stats(owner);
@@ -516,11 +565,10 @@ impl App {
         let mut r = RECT::default();
         let _ = unsafe { GetWindowRect(panel.hwnd(), &mut r) };
         let inside = pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom;
-        // The speed test pauses it too, once the panel has it.
         let pauses = Pauses {
             search_text: !self.query.is_empty(),
+            speedtest_running: matches!(self.speed, SpeedState::Running { .. }),
             popup_open: self.gear_open || self.audio_list_open,
-            ..Pauses::default()
         };
         if self.close.update(inside, pauses, now) {
             self.close_panel();
@@ -591,6 +639,7 @@ unsafe extern "system" fn owner_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         WM_PANEL_ASYNC if wp.0 == ASYNC_AUDIO => with_app(|app| app.on_audio()),
         WM_PANEL_ASYNC if wp.0 == ASYNC_MEDIA => with_app(|app| app.on_media()),
         WM_PANEL_ASYNC if wp.0 == ASYNC_STATS => with_app(|app| app.on_stats()),
+        WM_PANEL_ASYNC if wp.0 == ASYNC_SPEED => with_app(|app| app.on_speed()),
         WM_PANEL_WHEEL => with_app(|app| {
             let notches = app.panel.as_ref().map(|p| p.take_wheel()).unwrap_or(0);
             if notches != 0 {
@@ -713,6 +762,10 @@ pub fn run() -> windows::core::Result<()> {
                 stats: None,
                 sort_ram: false,
                 sampler: None,
+                speed: SpeedState::Idle,
+                speed_before: SpeedState::Idle,
+                speed_rx: None,
+                speed_cancel: None,
             });
         });
         with_app(|app| app.rebuild());
