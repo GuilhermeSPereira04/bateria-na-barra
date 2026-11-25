@@ -132,7 +132,7 @@ Fora do escopo: teclado Akko (`3151:502D`) e headset ME6S (`0C76:8688`) — com 
   reinicia. `adb.exe` procurado ao lado do `.exe` e depois no `PATH`.
   Processos do adb iniciados sem janela de console. O pareamento inicial
   (`adb pair`) é feito uma vez, manualmente, com instruções no README.
-- **Zaopin (3554:F527)**: protocolo desconhecido. **Caminho seguro**
+- **Zaopin (3554:F527)**: *Atualização 2026-11-24: protocolo obtido do driver oficial (`HIDUsb.dll`), ver `docs/zaopin-protocol.md`; o app envia exatamente o pedido de bateria do software oficial.* Plano original: protocolo desconhecido. **Caminho seguro**
   (decisão do usuário) — nenhum comando "chutado" de outras marcas é enviado
   ao receptor. Etapas, numa fase separada, depois do app funcionando:
   1. Ferramenta só de listagem (`examples/probe_zaopin.rs`): lista as

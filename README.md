@@ -2,12 +2,12 @@
 
 Mostra na barra de tarefas do Windows 11, à esquerda da bandeja, a bateria de:
 
-- 🖱 **Mouse Zaopin** (receptor 2.4 GHz `3554:F527`) — por enquanto mostra `--%` (veja *Limitações*)
+- 🖱 **Mouse Zaopin** (receptor 2.4 GHz `3554:F527`)
 - 🎮 **Controle PS5 (DualSense)** por Bluetooth
 - 📱 **Celular Android** via ADB por Wi-Fi
 
 ```
- 🖱 --%   🎮 64%⚡   📱 81%    ^  📶 🔊   12:41
+ 🖱 25%   🎮 95%   📱 81%⚡    ^  📶 🔊   12:41
 ```
 
 - Raio ⚡ = carregando. Texto vermelho = abaixo de 20%. `--%` esmaecido = conectado, mas sem leitura.
@@ -52,10 +52,14 @@ Se o celular sumir depois de um tempo, confira se a **Depuração por Wi-Fi** co
   DS4Windows). A bateria só aparece quando a **Steam** ou o **DS4Windows** está aberto e já
   colocou o controle no modo de relatório completo. Fora isso aparece `--%`. Se o DS4Windows
   esconder o controle com o HidHide, também aparece `--%`.
-- **Mouse Zaopin:** o protocolo de bateria ainda não é conhecido. O plano é capturar o que o
-  software oficial da Zaopin envia ao receptor (USBPcap + Wireshark) e repetir só esse pedido.
-  Até lá, `--%`. A listagem das interfaces do receptor está em `docs/zaopin-probe.txt`
-  (`cargo run --example probe_zaopin`, que não envia nada ao receptor).
+- **Mouse Zaopin:** o app envia ao receptor só o pedido de bateria que o software oficial
+  da Zaopin usa (tirado da `HIDUsb.dll` do driver; detalhes em `src/readers/zaopin.rs`).
+  O número vem do próprio mouse, que pode variar 1–2% conforme o uso. Com o mouse dormindo,
+  o último valor continua por 10 min e depois vira `--%`.
+  Ferramentas: `cargo run --example zaopin_battery` (uma leitura, mostra a resposta crua) e
+  `cargo run --example probe_zaopin` (lista as interfaces, não envia nada).
+- **Controle PS5:** para a bateria aparecer com a Steam, ative em Steam → Configurações →
+  Controle → "Steam Input para controles PlayStation".
 - Só o monitor principal e barra de tarefas horizontal embaixo.
 
 ## Compilar
