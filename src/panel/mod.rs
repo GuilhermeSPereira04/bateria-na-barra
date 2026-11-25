@@ -217,7 +217,7 @@ fn create_target(d2d: &ID2D1Factory, hwnd: HWND) -> windows::core::Result<ID2D1H
     let mut rc = RECT::default();
     unsafe { GetClientRect(hwnd, &mut rc)? };
     let props = D2D1_RENDER_TARGET_PROPERTIES {
-        r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
         // Premultiplied alpha so transparent pixels reveal the system backdrop.
         pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
         // Draw in physical pixels; the layout applies the DPI scale itself.
