@@ -38,6 +38,8 @@ use view::{Hit, Key, PanelView};
 pub const WM_PANEL_ASYNC: u32 = WM_APP + 10;
 /// `WM_PANEL_ASYNC` source: the app list for the search.
 pub const ASYNC_APPS: usize = 1;
+/// `WM_PANEL_ASYNC` source: the Wi-Fi and Bluetooth state.
+pub const ASYNC_RADIOS: usize = 2;
 /// Posted to the owner when the panel wants to close itself (Esc, click
 /// outside, lost activation). wParam: the panel's HWND.
 pub const WM_PANEL_CLOSED: u32 = WM_APP + 11;
@@ -291,6 +293,21 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             {
                 shared.click.set(Some(hit));
                 post_owner(hwnd, WM_PANEL_HIT);
+            }
+            LRESULT(0)
+        }
+        // Right-clicking a toggle opens its settings page (the "more" side).
+        WM_RBUTTONUP => {
+            if let Some(shared) = shared {
+                let more = match shared.hit_at(lp) {
+                    Some(Hit::Wifi) => Some(Hit::WifiMore),
+                    Some(Hit::Bluetooth) => Some(Hit::BtMore),
+                    _ => None,
+                };
+                if let Some(hit) = more {
+                    shared.click.set(Some(hit));
+                    post_owner(hwnd, WM_PANEL_HIT);
+                }
             }
             LRESULT(0)
         }

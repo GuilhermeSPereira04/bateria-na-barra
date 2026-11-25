@@ -6,6 +6,7 @@ mod config;
 mod media;
 mod model;
 mod panel;
+mod radios;
 mod readers;
 mod render;
 mod search;

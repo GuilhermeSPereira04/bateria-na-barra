@@ -17,9 +17,10 @@ use crate::config::{self, Accent, Colors, Config, GlassTint};
 use crate::model::{ALL, DeviceKind, ReadOutcome, Tracker};
 use crate::panel::trigger::{CloseRule, EdgeTrigger, Pauses};
 use crate::panel::layout::MAX_ROWS;
-use crate::panel::view::{Hit, Key, PanelView, Tab};
-use crate::panel::{ASYNC_APPS, PanelWindow, WM_PANEL_ASYNC, WM_PANEL_CLOSED, WM_PANEL_HIT, WM_PANEL_KEY};
+use crate::panel::view::{Hit, Key, PanelView, QuickState, Tab, Toggle};
+use crate::panel::{ASYNC_APPS, ASYNC_RADIOS, PanelWindow, WM_PANEL_ASYNC, WM_PANEL_CLOSED, WM_PANEL_HIT, WM_PANEL_KEY};
 use crate::readers::{self, WM_READING};
+use crate::radios::{self, RadioKind, RadioSnapshot};
 use crate::render::Strip;
 use crate::taskbar::{StripWindow, WM_STRIP_CLICK};
 use crate::tray::{self, Tray, WM_TRAY};
@@ -103,6 +104,9 @@ struct App {
     /// The app list while the panel is open, and its pending enumeration.
     catalog: Option<Catalog>,
     apps_rx: Option<Receiver<Vec<AppEntry>>>,
+    /// Last known Wi-Fi/Bluetooth state, and the pending read (panel open only).
+    quick: QuickState,
+    radios_rx: Option<Receiver<RadioSnapshot>>,
 }
 
 thread_local! {
@@ -154,6 +158,7 @@ impl App {
             self.panel = Some(panel);
             self.close = CloseRule::new(); // disarmed until the cursor enters
             self.apps_rx = Some(apps::enumerate_async(hwnd));
+            self.radios_rx = Some(radios::spawn(hwnd, || {}));
         }
     }
 
@@ -164,6 +169,37 @@ impl App {
         self.catalog = Some(Catalog::new(list));
         self.search();
         self.refresh_panel();
+    }
+
+    /// The Wi-Fi/Bluetooth state arrived from its worker thread.
+    fn on_radios(&mut self) {
+        let Some(snap) = self.radios_rx.as_ref().and_then(|rx| rx.try_recv().ok()) else { return };
+        self.radios_rx = None;
+        self.quick.wifi = snap.wifi;
+        self.quick.wifi_name = snap.wifi_name;
+        self.quick.bt = snap.bt;
+        self.quick.bt_connected = snap.bt_connected;
+        self.refresh_panel();
+    }
+
+    /// Flips a radio on a worker thread, then reads the state again.
+    fn toggle_radio(&mut self, hwnd: HWND, kind: RadioKind) {
+        let current = if kind == RadioKind::Wifi { self.quick.wifi } else { self.quick.bt };
+        if current == Toggle::Unavailable {
+            return;
+        }
+        let on = current == Toggle::On;
+        // Replacing the receiver discards a read still in flight.
+        self.radios_rx = Some(radios::spawn(hwnd, move || radios::set(kind, !on)));
+    }
+
+    /// Opens a Settings page; the panel gives way to it.
+    fn open_settings(&mut self, uri: &str) {
+        radios::open_settings(uri);
+        if let Some(panel) = self.panel.as_mut() {
+            panel.forget_previous(); // Settings gets the focus
+        }
+        self.close_panel();
     }
 
     /// Recomputes the results for the current query, highlighting the first.
@@ -218,6 +254,7 @@ impl App {
             query: self.query.clone(),
             results: self.results.clone(),
             selected: self.selected,
+            quick: self.quick.clone(),
             ..Default::default()
         }
     }
@@ -233,8 +270,12 @@ impl App {
     }
 
     /// A click on the panel. The other hits are wired by the tasks that give them data.
-    fn on_hit(&mut self, hit: Hit) {
+    fn on_hit(&mut self, hwnd: HWND, hit: Hit) {
         match hit {
+            Hit::Wifi => return self.toggle_radio(hwnd, RadioKind::Wifi),
+            Hit::Bluetooth => return self.toggle_radio(hwnd, RadioKind::Bluetooth),
+            Hit::WifiMore => return self.open_settings("ms-settings:network-wifi"),
+            Hit::BtMore => return self.open_settings("ms-settings:bluetooth"),
             Hit::Tab(tab) => self.tab = tab,
             Hit::Gear => self.gear_open = !self.gear_open,
             Hit::Accent(i) if i < config::ACCENTS.len() => self.set_config(Config { accent: Accent::Preset(i), ..self.config }),
@@ -261,6 +302,7 @@ impl App {
         // The app list and its icons only live while the panel is open.
         self.catalog = None;
         self.apps_rx = None;
+        self.radios_rx = None;
         self.results = Vec::new();
         self.query = String::new();
         // Hand the pages the panel touched back to the system.
@@ -334,7 +376,7 @@ unsafe extern "system" fn owner_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         }),
         WM_PANEL_HIT => with_app(|app| {
             if let Some(hit) = app.panel.as_ref().and_then(|p| p.take_click()) {
-                app.on_hit(hit);
+                app.on_hit(hwnd, hit);
             }
         }),
         WM_PANEL_KEY => with_app(|app| {
@@ -351,6 +393,7 @@ unsafe extern "system" fn owner_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             app.refresh_panel();
         }),
         WM_PANEL_ASYNC if wp.0 == ASYNC_APPS => with_app(|app| app.on_apps()),
+        WM_PANEL_ASYNC if wp.0 == ASYNC_RADIOS => with_app(|app| app.on_radios()),
         WM_STRIP_CLICK => with_app(|app| app.menu(hwnd)),
         WM_TRAY if is_click(lp.0 as u32) => with_app(|app| app.menu(hwnd)),
         WM_SETTINGCHANGE => {
@@ -455,6 +498,8 @@ pub fn run() -> windows::core::Result<()> {
                 selected: 0,
                 catalog: None,
                 apps_rx: None,
+                quick: QuickState::default(),
+                radios_rx: None,
             });
         });
         with_app(|app| app.rebuild());

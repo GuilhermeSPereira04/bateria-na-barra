@@ -18,7 +18,7 @@ pub enum Toggle {
     On,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct QuickState {
     pub wifi: Toggle,
     pub wifi_name: Option<String>,
