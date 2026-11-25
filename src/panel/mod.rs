@@ -44,6 +44,8 @@ pub const ASYNC_RADIOS: usize = 2;
 pub const ASYNC_MEDIA: usize = 3;
 /// `WM_PANEL_ASYNC` source: the audio outputs and the default one's state.
 pub const ASYNC_AUDIO: usize = 5;
+/// `WM_PANEL_ASYNC` source: a CPU/GPU/RAM sample for the Resources tab.
+pub const ASYNC_STATS: usize = 6;
 /// Posted to the owner when the panel wants to close itself (Esc, click
 /// outside, lost activation). wParam: the panel's HWND.
 pub const WM_PANEL_CLOSED: u32 = WM_APP + 11;

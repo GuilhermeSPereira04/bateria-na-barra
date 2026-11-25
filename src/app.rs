@@ -21,11 +21,12 @@ use crate::panel::trigger::{CloseRule, EdgeTrigger, Pauses};
 use crate::panel::layout::MAX_ROWS;
 use crate::panel::view::{Hit, Key, PanelView, QuickState, Tab, Toggle};
 use crate::panel::{
-    ASYNC_APPS, ASYNC_AUDIO, ASYNC_MEDIA, ASYNC_RADIOS, PanelWindow, WM_PANEL_ASYNC, WM_PANEL_CLOSED, WM_PANEL_HIT, WM_PANEL_KEY, WM_PANEL_WHEEL,
+    ASYNC_APPS, ASYNC_AUDIO, ASYNC_MEDIA, ASYNC_RADIOS, ASYNC_STATS, PanelWindow, WM_PANEL_ASYNC, WM_PANEL_CLOSED, WM_PANEL_HIT, WM_PANEL_KEY, WM_PANEL_WHEEL,
 };
 use crate::readers::{self, WM_READING};
 use crate::radios::{self, RadioKind, RadioSnapshot};
 use crate::render::Strip;
+use crate::sysinfo::{Stats, StatsWorker};
 use crate::taskbar::{StripWindow, WM_STRIP_CLICK};
 use crate::tray::{self, Tray, WM_TRAY};
 use crate::{startup, taskbar, theme};
@@ -81,7 +82,7 @@ fn hook_taskbar_moves(previous: Option<HWINEVENTHOOK>) -> Option<HWINEVENTHOOK> 
 }
 const TIMER_EXPIRE: usize = 2; // 60 s: let held values expire
 const TIMER_EDGE: usize = 3; // 100 ms: watch the top edge and the open panel
-// Reserved for the panel: TIMER_STATS = 4.
+const TIMER_STATS: usize = 4; // 1 s with the panel open on the Resources tab: sample
 const TIMER_MEDIA: usize = 5; // 2 s while the panel is open: read what is playing
 const TRAY_GLYPH: char = '\u{E83F}';
 const TRAY_ICON_PX: i32 = 32;
@@ -124,6 +125,11 @@ struct App {
     /// What is playing (last read) and the pending read (panel open only).
     media: Option<NowPlaying>,
     media_rx: Option<Receiver<Option<NowPlaying>>>,
+    /// Last resources sample, its column order, and the sampling thread
+    /// (panel open on the Resources tab only).
+    stats: Option<Stats>,
+    sort_ram: bool,
+    sampler: Option<StatsWorker>,
 }
 
 thread_local! {
@@ -165,6 +171,7 @@ impl App {
         }
         // Every opening starts on the first tab, with the colors row closed.
         self.tab = Tab::Resources;
+        self.sort_ram = false;
         self.gear_open = false;
         self.audio_list_open = false;
         self.config = config::load();
@@ -180,7 +187,36 @@ impl App {
             self.read_audio(hwnd);
             self.read_media(hwnd, None);
             unsafe { SetTimer(Some(hwnd), TIMER_MEDIA, 2000, None) };
+            self.sync_stats(hwnd);
         }
+    }
+
+    /// Samples only while the panel is open on the Resources tab: starts the
+    /// sampling thread and its timer on entering, drops both on leaving.
+    fn sync_stats(&mut self, hwnd: HWND) {
+        let wanted = self.panel.is_some() && self.tab == Tab::Resources;
+        if wanted && self.sampler.is_none() {
+            self.sampler = Some(StatsWorker::spawn(hwnd));
+            unsafe { SetTimer(Some(hwnd), TIMER_STATS, 1000, None) };
+        } else if !wanted && self.sampler.is_some() {
+            self.sampler = None;
+            self.stats = None; // the next visit starts from `…`
+            let _ = unsafe { KillTimer(Some(hwnd), TIMER_STATS) };
+        }
+    }
+
+    /// Every `TIMER_STATS` tick.
+    fn stats_tick(&mut self) {
+        if let Some(sampler) = self.sampler.as_mut() {
+            sampler.request();
+        }
+    }
+
+    /// A sample arrived from the sampling thread.
+    fn on_stats(&mut self) {
+        let Some(stats) = self.sampler.as_mut().and_then(|s| s.take()) else { return };
+        self.stats = Some(stats);
+        self.refresh_panel();
     }
 
     /// Sends `cmd` if any, then reads what is playing, on a worker thread.
@@ -363,6 +399,8 @@ impl App {
             selected: self.selected,
             quick: self.quick.clone(),
             media: self.media.clone(),
+            stats: self.stats.as_ref().map(|s| s.ranked(self.sort_ram, 5)),
+            sort_ram: self.sort_ram,
             audio_list: self.audio_list_open.then(|| self.audio_outputs.iter().map(|(_, name)| name.clone()).collect()),
             ..Default::default()
         }
@@ -400,7 +438,12 @@ impl App {
             Hit::MediaPrev => return self.media_command(hwnd, MediaCmd::Prev),
             Hit::MediaPlay => return self.media_command(hwnd, MediaCmd::PlayPause),
             Hit::MediaNext => return self.media_command(hwnd, MediaCmd::Next),
-            Hit::Tab(tab) => self.tab = tab,
+            Hit::Tab(tab) => {
+                self.tab = tab;
+                self.sync_stats(hwnd);
+            }
+            Hit::SortCpu => self.sort_ram = false,
+            Hit::SortRam => self.sort_ram = true,
             Hit::Gear => self.gear_open = !self.gear_open,
             Hit::Accent(i) if i < config::ACCENTS.len() => self.set_config(Config { accent: Accent::Preset(i), ..self.config }),
             Hit::AccentWindows => self.set_config(Config { accent: Accent::Windows, ..self.config }),
@@ -431,6 +474,7 @@ impl App {
         self.media_rx = None;
         let owner = HWND(OWNER.load(std::sync::atomic::Ordering::Relaxed) as _);
         let _ = unsafe { KillTimer(Some(owner), TIMER_MEDIA) };
+        self.sync_stats(owner);
         self.audio_list_open = false;
         self.results = Vec::new();
         self.query = String::new();
@@ -502,6 +546,7 @@ unsafe extern "system" fn owner_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         WM_TIMER if wp.0 == TIMER_EXPIRE => with_app(|app| app.rebuild()),
         WM_TIMER if wp.0 == TIMER_EDGE => with_app(|app| app.edge_tick(hwnd)),
         WM_TIMER if wp.0 == TIMER_MEDIA => with_app(|app| app.media_tick(hwnd)),
+        WM_TIMER if wp.0 == TIMER_STATS => with_app(|app| app.stats_tick()),
         // Ignore a late request from a panel that is already gone.
         WM_PANEL_CLOSED => with_app(|app| {
             if app.panel.as_ref().is_some_and(|p| p.hwnd().0 as usize == wp.0) {
@@ -530,6 +575,7 @@ unsafe extern "system" fn owner_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         WM_PANEL_ASYNC if wp.0 == ASYNC_RADIOS => with_app(|app| app.on_radios()),
         WM_PANEL_ASYNC if wp.0 == ASYNC_AUDIO => with_app(|app| app.on_audio()),
         WM_PANEL_ASYNC if wp.0 == ASYNC_MEDIA => with_app(|app| app.on_media()),
+        WM_PANEL_ASYNC if wp.0 == ASYNC_STATS => with_app(|app| app.on_stats()),
         WM_PANEL_WHEEL => with_app(|app| {
             let notches = app.panel.as_ref().map(|p| p.take_wheel()).unwrap_or(0);
             if notches != 0 {
@@ -648,6 +694,9 @@ pub fn run() -> windows::core::Result<()> {
                 audio_touched: false,
                 media: None,
                 media_rx: None,
+                stats: None,
+                sort_ram: false,
+                sampler: None,
             });
         });
         with_app(|app| app.rebuild());
