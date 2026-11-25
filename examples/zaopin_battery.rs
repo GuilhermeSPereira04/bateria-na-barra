@@ -5,7 +5,8 @@
 //! Request (output report 0x08, 17 bytes, collection usage page 0xFF02):
 //!   08 04 00*14 cs   with cs = 0x55 - sum(bytes 0..16)
 const VID: u16 = 0x3554;
-const PID: u16 = 0xF527;
+/// Wireless receiver and the mouse itself on a USB cable.
+const PIDS: [u16; 2] = [0xF527, 0xF526];
 
 fn checksum(buf: &[u8]) -> u8 {
     0x55u8.wrapping_sub(buf.iter().fold(0u8, |a, b| a.wrapping_add(*b)))
@@ -15,11 +16,12 @@ fn main() {
     let api = hidapi::HidApi::new().expect("hidapi init");
     let Some(info) = api
         .device_list()
-        .find(|d| d.vendor_id() == VID && d.product_id() == PID && d.usage_page() == 0xFF02)
+        .find(|d| d.vendor_id() == VID && PIDS.contains(&d.product_id()) && d.usage_page() == 0xFF02)
     else {
-        println!("receiver collection 0xFF02 not found");
+        println!("collection 0xFF02 not found");
         return;
     };
+    println!("device {:04X}:{:04X}", info.vendor_id(), info.product_id());
     let dev = info.open_device(&api).expect("open 0xFF02");
     let mut req = [0u8; 17];
     req[0] = 0x08;

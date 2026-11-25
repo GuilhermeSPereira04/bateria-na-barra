@@ -1,4 +1,5 @@
-//! Zaopin receiver (3554:F527, Compx-based).
+//! Zaopin mouse (Compx-based): 2.4 GHz receiver 3554:F527, or the mouse
+//! itself on its USB cable, 3554:F526 — same protocol on both.
 //!
 //! Battery query taken from the official driver (HIDUsb.dll,
 //! `UsbServer_ReadBatteryLevel` / `CS_UsbFinder_GetBatteryLevel` in mouse
@@ -10,10 +11,15 @@
 use crate::model::{Charge, ReadOutcome, Reading};
 
 pub const VID: u16 = 0x3554;
-pub const PID: u16 = 0xF527;
+/// Receiver (2.4 GHz) and wired mouse; the official software lists both.
+pub const PIDS: [u16; 2] = [0xF527, 0xF526];
 const USAGE_PAGE: u16 = 0xFF02;
 const REPORT_ID: u8 = 0x08;
 const CMD_BATTERY: u8 = 0x04;
+
+pub fn is_zaopin(vid: u16, pid: u16) -> bool {
+    vid == VID && PIDS.contains(&pid)
+}
 
 fn checksum(bytes: &[u8]) -> u8 {
     0x55u8.wrapping_sub(bytes.iter().fold(0u8, |acc, b| acc.wrapping_add(*b)))
@@ -41,14 +47,19 @@ pub fn parse_reply(buf: &[u8]) -> Option<Reading> {
 }
 
 /// Sends the battery query (up to 3 tries, 100 ms each, like the driver).
-/// Receiver missing → `Offline`; no valid reply (e.g. mouse asleep) → `Failed`.
+/// Neither receiver nor cable → `Offline`; no valid reply (e.g. mouse asleep) → `Failed`.
 pub fn read_once(api: &mut hidapi::HidApi) -> ReadOutcome {
-    // Enumerate only this receiver instead of querying every HID device.
+    // Enumerate only the Zaopin devices instead of querying every HID device.
     api.reset_devices().ok();
-    if api.add_devices(VID, PID).is_err() {
-        return ReadOutcome::Failed;
+    for pid in PIDS {
+        if api.add_devices(VID, pid).is_err() {
+            return ReadOutcome::Failed;
+        }
     }
-    let Some(info) = api.device_list().find(|d| d.usage_page() == USAGE_PAGE) else {
+    let Some(info) = api
+        .device_list()
+        .find(|d| is_zaopin(d.vendor_id(), d.product_id()) && d.usage_page() == USAGE_PAGE)
+    else {
         return ReadOutcome::Offline;
     };
     let Ok(dev) = info.open_device(api) else {
@@ -106,6 +117,21 @@ mod tests {
     fn second_real_reply_has_valid_checksum() {
         let r = [0x08, 0x04, 0x00, 0x00, 0x00, 0x02, 0x19, 0x00, 0x0E, 0x39, 0, 0, 0, 0, 0, 0, 0xE7];
         assert_eq!(parse_reply(&r), Some(Reading { percent: 25, charge: Charge::Discharging }));
+    }
+
+    #[test]
+    fn parses_real_charging_reply_over_cable() {
+        // Captured with the mouse on its USB cable (PID F526).
+        let r = [0x08, 0x04, 0x00, 0x00, 0x00, 0x02, 0x28, 0x01, 0x0E, 0xBF, 0, 0, 0, 0, 0, 0, 0x51];
+        assert_eq!(parse_reply(&r), Some(Reading { percent: 40, charge: Charge::Charging }));
+    }
+
+    #[test]
+    fn wired_and_wireless_are_supported() {
+        assert!(is_zaopin(0x3554, 0xF527)); // 2.4 GHz receiver
+        assert!(is_zaopin(0x3554, 0xF526)); // mouse on its USB cable
+        assert!(!is_zaopin(0x3554, 0x1234));
+        assert!(!is_zaopin(0x054C, 0xF527));
     }
 
     #[test]

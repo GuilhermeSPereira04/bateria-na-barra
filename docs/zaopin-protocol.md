@@ -40,5 +40,12 @@ Observed: 25 % / 3637–3645 mV, not charging. The official app showed 23 % at
 another moment; the percentage is computed by the mouse from its voltage and
 moves a little with load.
 
-Not yet observed: a reply while charging (expected status > 0) and the reply
-while the mouse is asleep (the app then shows the held value, then `--%`).
+On the USB cable the mouse shows up as `3554:F526` ("2.4G Dual Mode Mouse")
+with the same `0xFF02` collection and answers the same query:
+
+```
+reply    08 04 00 00 00 02 28 01 0E BF 00 00 00 00 00 00 51   (40 %, charging, 3775 mV)
+```
+
+Not yet observed: the reply while the mouse is asleep (the app then shows the
+held value, then `--%`).

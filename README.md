@@ -2,7 +2,7 @@
 
 Mostra na barra de tarefas do Windows 11, à esquerda da bandeja, a bateria de:
 
-- 🖱 **Mouse Zaopin** (receptor 2.4 GHz `3554:F527`)
+- 🖱 **Mouse Zaopin** (receptor 2.4 GHz `3554:F527`, ou o mouse no cabo USB `3554:F526`)
 - 🎮 **Controle PS5 (DualSense)** por Bluetooth
 - 📱 **Celular Android** via ADB por Wi-Fi
 
