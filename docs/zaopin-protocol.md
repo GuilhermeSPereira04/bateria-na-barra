@@ -49,3 +49,20 @@ reply    08 04 00 00 00 02 28 01 0E BF 00 00 00 00 00 00 51   (40 %, charging, 3
 
 Not yet observed: the reply while the mouse is asleep (the app then shows the
 held value, then `--%`).
+
+## What the official app shows (smoothing)
+
+The app does not show byte 6 directly. `HIDUsb.dll` (RVA `0x63f0`, enabled by
+the app through `UsbServer_SetBatteryOptimizeEnable(1)`) keeps a displayed
+value and moves it 1 % per tick toward the mouse's value:
+
+- discharging: only down, 1 % per 10 s, never below the mouse value; at
+  <= 15 % it snaps to 15; mouse at 0 → 0;
+- charging: only up, 1 % per 10 s while more than 10 below the mouse value;
+  with the mouse >= 95 and the display >= 85, 1 % per 5 min up to 99; 100 after
+  10 ticks with the mouse at 100.
+
+Seen: mouse 25 % → app 23 %; mouse 45 % charging → app 31 % (still climbing).
+battery-bar applies the same walk (`zaopin::Smoother`). It starts from the
+mouse value (or 10 below it while charging) because it does not have the
+app's saved history.

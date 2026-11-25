@@ -178,3 +178,189 @@ mod tests {
         assert_eq!(parse_reply(&REAL_REPLY[..10]), None);
     }
 }
+
+/// What the official app shows. Its HIDUsb.dll does not show the mouse's
+/// percent directly; it walks a displayed value toward it, 1 % per tick
+/// (RVA 0x63f0, "battery optimize", enabled by the app):
+/// - discharging: only goes down, 1 % per 10 s, never below the mouse's
+///   value; at 15 % or less it snaps down to 15; mouse at 0 → 0.
+/// - charging: only goes up, 1 % per 10 s while it is more than 10 below the
+///   mouse's value (the cable inflates the voltage-based reading); once the
+///   mouse says ≥ 95 and the display is ≥ 85, 1 % per 5 min up to 99; 100
+///   after 10 ticks with the mouse at 100.
+pub struct Smoother {
+    shown: Option<u8>,
+    pending: std::time::Duration,
+    full_ticks: u32,
+}
+
+const TICK: std::time::Duration = std::time::Duration::from_secs(10);
+const SLOW_TICK: std::time::Duration = std::time::Duration::from_secs(300);
+/// Bounds the catch-up after a long gap (e.g. PC asleep).
+const MAX_PENDING: std::time::Duration = std::time::Duration::from_secs(4 * 3600);
+
+impl Smoother {
+    pub fn new() -> Self {
+        Smoother { shown: None, pending: std::time::Duration::ZERO, full_ticks: 0 }
+    }
+
+    /// `elapsed` = time since the previous call.
+    pub fn update(&mut self, raw: Reading, elapsed: std::time::Duration) -> Reading {
+        let charging = raw.charge != Charge::Discharging;
+        let mut shown = match self.shown {
+            // No history: start where the walk would settle.
+            None => if charging { raw.percent.saturating_sub(10) } else { raw.percent },
+            Some(shown) => {
+                self.pending = (self.pending + elapsed).min(MAX_PENDING);
+                let mut shown = shown;
+                loop {
+                    let near_full = charging && raw.percent >= 95 && shown >= 85;
+                    let step = if near_full { SLOW_TICK } else { TICK };
+                    if self.pending < step {
+                        break;
+                    }
+                    self.pending -= step;
+                    shown = self.tick(shown, raw, charging, near_full);
+                }
+                shown
+            }
+        };
+        shown = shown.min(100);
+        self.shown = Some(shown);
+        let charge = match (charging, shown) {
+            (false, _) => Charge::Discharging,
+            (true, 100) => Charge::Full,
+            (true, _) => Charge::Charging,
+        };
+        Reading { percent: shown, charge }
+    }
+
+    fn tick(&mut self, shown: u8, raw: Reading, charging: bool, near_full: bool) -> u8 {
+        if !charging {
+            self.full_ticks = 0;
+            if shown <= raw.percent {
+                return shown;
+            }
+            if raw.percent == 0 {
+                return 0;
+            }
+            let down = shown - 1;
+            return if raw.percent <= 15 && down > 15 { 15 } else { down };
+        }
+        let mut up = shown;
+        if near_full {
+            if up < 99 {
+                up += 1;
+            }
+        } else if raw.percent as i32 - shown as i32 > 10 {
+            up += 1;
+        }
+        if raw.percent >= 100 {
+            self.full_ticks += 1;
+            if self.full_ticks > 9 {
+                up = 100;
+            }
+        } else {
+            self.full_ticks = 0;
+        }
+        up
+    }
+}
+
+#[cfg(test)]
+mod smoother_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn dis(p: u8) -> Reading {
+        Reading { percent: p, charge: Charge::Discharging }
+    }
+    fn chg(p: u8) -> Reading {
+        Reading { percent: p, charge: if p == 100 { Charge::Full } else { Charge::Charging } }
+    }
+    fn secs(s: u64) -> Duration {
+        Duration::from_secs(s)
+    }
+    fn started_at(r: Reading) -> Smoother {
+        let mut s = Smoother::new();
+        s.update(r, Duration::ZERO);
+        s
+    }
+
+    #[test]
+    fn first_discharging_reading_is_the_mouse_value() {
+        assert_eq!(Smoother::new().update(dis(25), secs(0)), dis(25));
+    }
+
+    #[test]
+    fn first_charging_reading_is_10_below() {
+        assert_eq!(Smoother::new().update(chg(45), secs(0)), chg(35));
+    }
+
+    #[test]
+    fn discharging_never_goes_up() {
+        let mut s = started_at(dis(23));
+        assert_eq!(s.update(dis(25), secs(60)).percent, 23);
+    }
+
+    #[test]
+    fn discharging_drops_one_per_10s_down_to_the_mouse_value() {
+        let mut s = started_at(dis(30));
+        assert_eq!(s.update(dis(25), secs(20)).percent, 28);
+        assert_eq!(s.update(dis(25), secs(60)).percent, 25);
+    }
+
+    #[test]
+    fn time_below_a_tick_is_kept() {
+        let mut s = started_at(dis(30));
+        assert_eq!(s.update(dis(25), secs(6)).percent, 30);
+        assert_eq!(s.update(dis(25), secs(6)).percent, 29);
+    }
+
+    #[test]
+    fn plugging_the_cable_climbs_slowly_like_the_official_app() {
+        // Seen on 2026-11-24: official 23-25 % unplugged, then 31 % while the
+        // mouse said 45 % on the cable.
+        let mut s = started_at(dis(25));
+        assert_eq!(s.update(chg(45), secs(60)), chg(31));
+        assert_eq!(s.update(chg(45), secs(60)).percent, 35); // stops 10 below
+        assert_eq!(s.update(chg(45), secs(600)).percent, 35);
+    }
+
+    #[test]
+    fn near_full_climbs_one_per_5_min_to_99() {
+        let mut s = started_at(chg(45));
+        s.shown = Some(90);
+        assert_eq!(s.update(chg(96), secs(60)).percent, 90);
+        assert_eq!(s.update(chg(96), secs(240)).percent, 91);
+        assert_eq!(s.update(chg(96), secs(3600)).percent, 99);
+    }
+
+    #[test]
+    fn full_after_ten_ticks_at_100() {
+        let mut s = started_at(chg(45));
+        s.shown = Some(80);
+        assert_eq!(s.update(chg(100), secs(50)).percent, 85); // fast up to 85
+        assert_eq!(s.update(chg(100), secs(1200)).percent, 89); // then 1 per 5 min
+        assert_eq!(s.update(chg(100), secs(300)), chg(100)); // 10th tick at 100
+    }
+
+    #[test]
+    fn low_battery_snaps_to_15() {
+        let mut s = started_at(dis(40));
+        assert_eq!(s.update(dis(10), secs(10)).percent, 15);
+        assert_eq!(s.update(dis(10), secs(50)).percent, 10);
+    }
+
+    #[test]
+    fn empty_is_zero() {
+        let mut s = started_at(dis(40));
+        assert_eq!(s.update(dis(0), secs(10)).percent, 0);
+    }
+
+    #[test]
+    fn long_gap_is_bounded() {
+        let mut s = started_at(dis(90));
+        assert_eq!(s.update(dis(20), secs(u32::MAX as u64)).percent, 20);
+    }
+}

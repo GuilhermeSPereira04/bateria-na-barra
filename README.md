@@ -54,7 +54,8 @@ Se o celular sumir depois de um tempo, confira se a **Depuração por Wi-Fi** co
   esconder o controle com o HidHide, também aparece `--%`.
 - **Mouse Zaopin:** o app envia ao receptor só o pedido de bateria que o software oficial
   da Zaopin usa (tirado da `HIDUsb.dll` do driver; detalhes em `src/readers/zaopin.rs`).
-  O número vem do próprio mouse, que pode variar 1–2% conforme o uso. Com o mouse dormindo,
+  O número segue a mesma suavização do app oficial: descarregando só desce, carregando só sobe e
+  fica até 10% abaixo do que o mouse informa (o cabo infla a leitura). Com o mouse dormindo,
   o último valor continua por 10 min e depois vira `--%`.
   Ferramentas: `cargo run --example zaopin_battery` (uma leitura, mostra a resposta crua) e
   `cargo run --example probe_zaopin` (lista as interfaces, não envia nada).

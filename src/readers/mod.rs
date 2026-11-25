@@ -5,7 +5,7 @@ pub mod dualsense;
 pub mod zaopin;
 
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
@@ -44,9 +44,20 @@ pub fn spawn_all(hwnd_ui: isize, tx: Sender<(DeviceKind, ReadOutcome)>) -> Vec<S
             let tx = tx.clone();
             std::thread::spawn(move || {
                 let mut api: Option<hidapi::HidApi> = None;
+                // Mouse only: show what the official Zaopin app shows.
+                let mut smoother = zaopin::Smoother::new();
+                let mut last = Instant::now();
                 loop {
                     let outcome = match kind {
-                        DeviceKind::Mouse => hid_read(&mut api, zaopin::read_once),
+                        DeviceKind::Mouse => match hid_read(&mut api, zaopin::read_once) {
+                            ReadOutcome::Ok(raw) => {
+                                let now = Instant::now();
+                                let shown = smoother.update(raw, now - last);
+                                last = now;
+                                ReadOutcome::Ok(shown)
+                            }
+                            other => other,
+                        },
                         DeviceKind::Controller => hid_read(&mut api, dualsense::read_once),
                         DeviceKind::Phone => adb::read_once(),
                     };
