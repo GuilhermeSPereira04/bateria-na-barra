@@ -14,6 +14,7 @@ use windows::core::{PCWSTR, w};
 
 use crate::apps::{self, AppEntry, Catalog};
 use crate::audio::{self, AudioSnapshot};
+use crate::calendar;
 use crate::config::{self, Accent, Colors, Config, GlassTint};
 use crate::media::{self, MediaCmd, NowPlaying};
 use crate::model::{ALL, DeviceKind, ReadOutcome, Tracker};
@@ -89,6 +90,12 @@ const TRAY_ICON_PX: i32 = 32;
 /// Volume change per wheel notch over the audio toggle, in percentage points.
 const VOLUME_STEP: i32 = 2;
 
+/// The local date as (year, month, day).
+fn today() -> (i32, u32, u32) {
+    let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    (t.wYear as i32, t.wMonth as u32, t.wDay as u32)
+}
+
 struct App {
     tracker: Tracker,
     strip: StripWindow,
@@ -103,6 +110,8 @@ struct App {
     close: CloseRule,
     tab: Tab,
     gear_open: bool,
+    /// Month shown on the calendar tab (year, 1..=12).
+    month: (i32, u32),
     config: Config,
     colors: Colors,
     /// Search text, its matches and the highlighted one (panel open only).
@@ -173,6 +182,8 @@ impl App {
         self.tab = Tab::Resources;
         self.sort_ram = false;
         self.gear_open = false;
+        let (year, month, _) = today();
+        self.month = (year, month);
         self.audio_list_open = false;
         self.config = config::load();
         self.colors = config::resolve(&self.config);
@@ -393,6 +404,8 @@ impl App {
             battery: ALL.iter().map(|&k| (k, self.tracker.view(k, now))).collect(),
             tab: self.tab,
             gear_open: self.gear_open,
+            month: self.month,
+            today: today(),
             colors: self.colors,
             query: self.query.clone(),
             results: self.results.clone(),
@@ -442,6 +455,8 @@ impl App {
                 self.tab = tab;
                 self.sync_stats(hwnd);
             }
+            Hit::CalPrev => self.month = calendar::shift(self.month, -1),
+            Hit::CalNext => self.month = calendar::shift(self.month, 1),
             Hit::SortCpu => self.sort_ram = false,
             Hit::SortRam => self.sort_ram = true,
             Hit::Gear => self.gear_open = !self.gear_open,
@@ -679,6 +694,7 @@ pub fn run() -> windows::core::Result<()> {
                 close: CloseRule::new(),
                 tab: Tab::Resources,
                 gear_open: false,
+                month: (0, 1),
                 config: Config::default(),
                 colors: Colors::default(),
                 query: String::new(),

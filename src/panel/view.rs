@@ -84,6 +84,8 @@ pub struct PanelView {
     pub sort_ram: bool,
     /// (year, month 1..=12).
     pub month: (i32, u32),
+    /// (year, month, day) of the current local date.
+    pub today: (i32, u32, u32),
     pub speed: crate::speedtest::SpeedState,
     pub gear_open: bool,
     pub audio_list: Option<Vec<String>>,

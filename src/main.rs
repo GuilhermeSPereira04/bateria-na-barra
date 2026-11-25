@@ -3,6 +3,7 @@
 mod app;
 mod apps;
 mod audio;
+mod calendar;
 mod config;
 mod media;
 mod model;

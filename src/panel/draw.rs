@@ -579,12 +579,33 @@ fn calendar(p: &Painter, view: &PanelView, l: &Layout) {
         let title = format!("{} {year}", MONTHS[month as usize - 1]);
         p.text(&title, &p.f.bold, rect(prev.right, prev.top, next.left, prev.bottom), Align::Center, white(0.92));
     }
-    // Weekday header, Sunday first; the day grid comes with Task 10.
+    // Weekday header, Sunday first.
     let top = prev.bottom + p.px(8.0);
     let col = (next.right - prev.left) / 7.0;
     for (i, d) in ["D", "S", "T", "Q", "Q", "S", "S"].into_iter().enumerate() {
         let x = prev.left + i as f32 * col;
         p.text(d, &p.f.small, rect(x, top, x + col, top + p.px(20.0)), Align::Center, white(0.6));
+    }
+    if !(1..=12).contains(&month) {
+        return;
+    }
+    let grid_top = top + p.px(20.0);
+    let row_h = p.px(24.0);
+    let is_today_month = view.today.0 == year && view.today.1 == month;
+    for (r, week) in crate::calendar::month_grid(year, month).iter().enumerate() {
+        for (c, day) in week.iter().enumerate() {
+            let Some(day) = *day else { continue };
+            let x = prev.left + c as f32 * col;
+            let y = grid_top + r as f32 * row_h;
+            let cell = rect(x, y, x + col, y + row_h);
+            let today = is_today_month && view.today.2 == day as u32;
+            if today {
+                let (cx, cy) = (x + col / 2.0, y + row_h / 2.0);
+                p.circle(cx, cy, row_h / 2.0 - p.px(1.0), rgb(view.colors.accent, 1.0), None);
+            }
+            let alpha = if today { 1.0 } else { 0.85 };
+            p.text(&day.to_string(), &p.f.text, cell, Align::Center, white(alpha));
+        }
     }
 }
 
@@ -694,6 +715,7 @@ mod tests {
                 top: vec![ProcRow { name: "chrome".into(), cpu: 4.5, ram: 2 << 30 }],
             }),
             month: (2026, 11),
+            today: (2026, 11, 25),
             hover: Some(Hit::Wifi),
             ..Default::default()
         }
