@@ -12,6 +12,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, 
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
+use crate::config::{self, Accent, Colors, Config, GlassTint};
 use crate::model::{ALL, DeviceKind, ReadOutcome, Tracker};
 use crate::panel::trigger::{CloseRule, EdgeTrigger, Pauses};
 use crate::panel::view::{Hit, PanelView, Tab};
@@ -91,6 +92,8 @@ struct App {
     close: CloseRule,
     tab: Tab,
     gear_open: bool,
+    config: Config,
+    colors: Colors,
 }
 
 thread_local! {
@@ -133,6 +136,8 @@ impl App {
         // Every opening starts on the first tab, with the colors row closed.
         self.tab = Tab::Resources;
         self.gear_open = false;
+        self.config = config::load();
+        self.colors = config::resolve(&self.config);
         if let Ok(panel) = PanelWindow::open(hwnd, self.panel_view()) {
             self.panel = Some(panel);
             self.close = CloseRule::new(); // disarmed until the cursor enters
@@ -146,6 +151,7 @@ impl App {
             battery: ALL.iter().map(|&k| (k, self.tracker.view(k, now))).collect(),
             tab: self.tab,
             gear_open: self.gear_open,
+            colors: self.colors,
             ..Default::default()
         }
     }
@@ -165,9 +171,19 @@ impl App {
         match hit {
             Hit::Tab(tab) => self.tab = tab,
             Hit::Gear => self.gear_open = !self.gear_open,
+            Hit::Accent(i) if i < config::ACCENTS.len() => self.set_config(Config { accent: Accent::Preset(i), ..self.config }),
+            Hit::AccentWindows => self.set_config(Config { accent: Accent::Windows, ..self.config }),
+            Hit::Tint(i) if i < GlassTint::ALL.len() => self.set_config(Config { tint: GlassTint::ALL[i], ..self.config }),
             _ => return,
         }
         self.refresh_panel();
+    }
+
+    /// Applies, saves and resolves a new color choice (the caller redraws).
+    fn set_config(&mut self, config: Config) {
+        self.config = config;
+        config::save(&config);
+        self.colors = config::resolve(&config);
     }
 
     fn close_panel(&mut self) {
@@ -257,6 +273,9 @@ unsafe extern "system" fn owner_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                     app.dark = theme::taskbar_is_dark();
                     let icon = app.strip.renderer().render_glyph_icon(TRAY_GLYPH, app.dark, TRAY_ICON_PX);
                     app.tray.set_icon(icon);
+                    if app.config.accent == Accent::Windows {
+                        app.colors = config::resolve(&app.config);
+                    }
                     app.rebuild();
                 });
             }
@@ -342,6 +361,8 @@ pub fn run() -> windows::core::Result<()> {
                 close: CloseRule::new(),
                 tab: Tab::Resources,
                 gear_open: false,
+                config: Config::default(),
+                colors: Colors::default(),
             });
         });
         with_app(|app| app.rebuild());

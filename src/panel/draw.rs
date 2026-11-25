@@ -7,7 +7,7 @@ use windows_numerics::Vector2;
 
 use super::layout::{INSET, Layout, MAX_ROWS, ROW_H, scale};
 use super::view::{Hit, PanelView, Tab, Toggle};
-use crate::config::{ACCENTS, Colors};
+use crate::config::{ACCENTS, Accent, Colors, GlassTint};
 use crate::model::ItemView;
 use crate::render::{BOLT, ICON_FONT, TEXT_FONT, device_glyph, item_style, rgb};
 use crate::speedtest::{Phase, SpeedState};
@@ -225,30 +225,25 @@ fn search(p: &Painter, view: &PanelView, l: &Layout) {
     }
 }
 
-/// Index of the glass tint the colors use (dark, light, accent), as Task 4 resolves them.
-fn tint_index(c: &Colors) -> Option<usize> {
-    match c.tint {
-        (0x000000, a) if a == 0.25 => Some(0),
-        (0xFFFFFF, a) if a == 0.18 => Some(1),
-        (rgb, a) if rgb == c.accent && a == 0.15 => Some(2),
-        _ => None,
-    }
-}
-
 fn colors_row(p: &Painter, colors: &Colors, l: &Layout) {
     for (i, &hex) in ACCENTS.iter().enumerate() {
         let Some(r) = l.rect(Hit::Accent(i)) else { continue };
         let (cx, cy) = ((r.left + r.right) / 2.0, (r.top + r.bottom) / 2.0);
         p.circle(cx, cy, p.px(10.0), rgb(hex, 1.0), None);
-        if hex == colors.accent {
+        if colors.accent_choice == Accent::Preset(i) {
             p.circle(cx, cy, p.px(13.0), white(0.9), Some(p.px(1.5)));
         }
     }
     if let Some(r) = l.rect(Hit::AccentWindows) {
-        p.fill(r, white(CARD));
-        p.text(ACCENT_WINDOWS, &p.f.text, r, Align::Center, white(0.92));
+        if colors.accent_choice == Accent::Windows {
+            p.fill(r, rgb(colors.accent, 1.0));
+            p.text(ACCENT_WINDOWS, &p.f.bold, r, Align::Center, rgb(ON_ACCENT, 0.9));
+        } else {
+            p.fill(r, white(CARD));
+            p.text(ACCENT_WINDOWS, &p.f.text, r, Align::Center, white(0.92));
+        }
     }
-    let selected = tint_index(colors);
+    let selected = GlassTint::ALL.iter().position(|&t| t == colors.tint_choice);
     for (i, name) in ["Escuro", "Claro", "Destaque"].into_iter().enumerate() {
         let Some(r) = l.rect(Hit::Tint(i)) else { continue };
         if selected == Some(i) {
@@ -655,15 +650,6 @@ mod tests {
             let room = r.right - r.left - 2.0 * 8.0 * scale(dpi);
             assert!(m.width <= room, "dpi {dpi}: text {} > room {room}", m.width);
         }
-    }
-
-    #[test]
-    fn tint_index_matches_presets() {
-        let accent = 0x60CDFF;
-        assert_eq!(tint_index(&Colors::default()), Some(0));
-        assert_eq!(tint_index(&Colors { accent, tint: (0xFFFFFF, 0.18) }), Some(1));
-        assert_eq!(tint_index(&Colors { accent, tint: (accent, 0.15) }), Some(2));
-        assert_eq!(tint_index(&Colors { accent, tint: (0x123456, 0.5) }), None);
     }
 
     #[test]
