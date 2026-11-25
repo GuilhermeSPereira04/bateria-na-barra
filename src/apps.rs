@@ -15,7 +15,7 @@ use windows::Win32::UI::Shell::{
     SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING, SIIGBF_ICONONLY, SHCreateItemFromParsingName, SHGetKnownFolderItem,
     ShellExecuteW,
 };
-use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, SW_SHOWNORMAL};
+use windows::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow, PostMessageW, SW_SHOWNORMAL};
 use windows::core::{HSTRING, w};
 
 /// Icon size asked from the shell, in pixels.
@@ -95,6 +95,9 @@ fn shell_path(id: &str) -> HSTRING {
 /// Opens the app (Store apps by AppUserModelID, Win32 ones by parsing name).
 pub fn launch(id: &str) {
     unsafe {
+        // We hold the foreground (the panel): let the app, possibly activated
+        // by another process (Store apps, single-instance apps), take it.
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
         ShellExecuteW(None, w!("open"), &shell_path(id), None, None, SW_SHOWNORMAL);
     }
 }

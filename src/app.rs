@@ -201,6 +201,9 @@ impl App {
         }
         let Some(id) = self.results.get(i).map(|a| a.id.clone()) else { return };
         apps::launch(&id);
+        if let Some(panel) = self.panel.as_mut() {
+            panel.forget_previous(); // the launched app gets the focus
+        }
         self.close_panel();
     }
 

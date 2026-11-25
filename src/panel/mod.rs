@@ -430,6 +430,12 @@ impl PanelWindow {
         });
     }
 
+    /// Don't give the focus back on close: an app launched from the panel is
+    /// about to take it, and the previous window must not jump over it.
+    pub fn forget_previous(&mut self) {
+        self.previous = HWND::default();
+    }
+
     /// The click announced by the last `WM_PANEL_HIT`, once.
     pub fn take_click(&self) -> Option<Hit> {
         self.shared.click.take()
