@@ -9,6 +9,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
@@ -166,6 +167,18 @@ fn is_fullscreen(rect: RECT, style: u32, monitor: RECT) -> bool {
     covers && style & WS_CAPTION.0 != WS_CAPTION.0
 }
 
+/// Hide when the foreground window is fullscreen, or when the shell itself
+/// reports a fullscreen app / presentation (also covers an overlay or popup
+/// taking focus while a game keeps running fullscreen).
+fn fullscreen_active(foreground_fullscreen: bool, shell_state: QUERY_USER_NOTIFICATION_STATE) -> bool {
+    foreground_fullscreen
+        || matches!(shell_state, QUNS_BUSY | QUNS_RUNNING_D3D_FULL_SCREEN | QUNS_PRESENTATION_MODE)
+}
+
+fn shell_state() -> QUERY_USER_NOTIFICATION_STATE {
+    unsafe { SHQueryUserNotificationState() }.unwrap_or(QUNS_ACCEPTS_NOTIFICATIONS)
+}
+
 /// True when the foreground window (not the shell, not us) covers the whole monitor.
 fn foreground_is_fullscreen(own: HWND, monitor: RECT) -> bool {
     unsafe {
@@ -287,7 +300,7 @@ impl StripWindow {
         let Some(geo) = query_geometry() else {
             return self.hide();
         };
-        if foreground_is_fullscreen(self.hwnd, geo.monitor) {
+        if fullscreen_active(foreground_is_fullscreen(self.hwnd, geo.monitor), shell_state()) {
             return self.hide();
         }
         let tb_height = geo.tb.bottom - geo.tb.top;
@@ -380,6 +393,21 @@ mod tests {
         assert!(!overlaps(strip, &[(200, 300)]));
         assert!(overlaps(strip, &[(10, 20), (190, 250)]));
         assert!(!overlaps(strip, &[]));
+    }
+
+    #[test]
+    fn shell_fullscreen_state_hides_even_without_focus() {
+        // An overlay/popup has focus while an exclusive-fullscreen game runs.
+        assert!(fullscreen_active(false, QUNS_RUNNING_D3D_FULL_SCREEN));
+        assert!(fullscreen_active(false, QUNS_BUSY));
+        assert!(fullscreen_active(false, QUNS_PRESENTATION_MODE));
+    }
+
+    #[test]
+    fn normal_shell_state_follows_foreground_check() {
+        assert!(!fullscreen_active(false, QUNS_ACCEPTS_NOTIFICATIONS));
+        assert!(!fullscreen_active(false, QUNS_QUIET_TIME)); // Do Not Disturb is not fullscreen
+        assert!(fullscreen_active(true, QUNS_ACCEPTS_NOTIFICATIONS));
     }
 
     const MONITOR: RECT = RECT { left: 0, top: 0, right: 1920, bottom: 1080 };

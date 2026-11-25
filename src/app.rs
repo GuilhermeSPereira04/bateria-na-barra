@@ -18,7 +18,8 @@ use crate::tray::{self, Tray, WM_TRAY};
 use crate::{startup, theme};
 
 const TIMER_SYNC: usize = 1; // 1 s: keep the strip placed and on top
-/// Posted by the WinEvent hook when the taskbar moves (auto-hide slide, resize).
+/// Posted by the WinEvent hooks when the taskbar moves (auto-hide slide,
+/// resize) or the foreground window changes (fullscreen check).
 const WM_TASKBAR_MOVED: u32 = WM_APP + 5;
 
 static OWNER: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
@@ -26,7 +27,7 @@ static TASKBAR: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize:
 
 unsafe extern "system" fn on_location_change(
     _hook: HWINEVENTHOOK,
-    _event: u32,
+    event: u32,
     hwnd: HWND,
     id_object: i32,
     _id_child: i32,
@@ -34,7 +35,8 @@ unsafe extern "system" fn on_location_change(
     _time: u32,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
-    if id_object == OBJID_WINDOW.0 && hwnd.0 as isize == TASKBAR.load(Relaxed) {
+    let foreground_changed = event == EVENT_SYSTEM_FOREGROUND;
+    if foreground_changed || (id_object == OBJID_WINDOW.0 && hwnd.0 as isize == TASKBAR.load(Relaxed)) {
         let owner = HWND(OWNER.load(Relaxed) as _);
         let _ = unsafe { PostMessageW(Some(owner), WM_TASKBAR_MOVED, WPARAM(0), LPARAM(0)) };
     }
@@ -101,12 +103,19 @@ impl App {
             tray::CMD_STARTUP => {
                 let _ = startup::set_enabled(!startup::is_enabled());
             }
+            // Destroying the window here would re-enter owner_proc while APP is
+            // borrowed; close it once this handler has returned.
             tray::CMD_QUIT => unsafe {
-                let _ = DestroyWindow(hwnd);
+                let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
             },
             _ => {}
         }
     }
+}
+
+/// Removes the app state (dropping it removes the tray icon).
+fn take_app() -> Option<App> {
+    APP.with(|cell| cell.try_borrow_mut().ok().and_then(|mut app| app.take()))
 }
 
 fn with_app(f: impl FnOnce(&mut App)) {
@@ -154,7 +163,7 @@ unsafe extern "system" fn owner_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             app.strip.sync();
         }),
         WM_DESTROY => {
-            APP.with(|cell| cell.borrow_mut().take()); // drops the tray icon
+            drop(take_app()); // drops the tray icon
             unsafe { PostQuitMessage(0) };
         }
         m if m != 0 && APP.with(|c| c.try_borrow().ok().and_then(|a| a.as_ref().map(|a| a.taskbar_created))) == Some(m) => {
@@ -198,6 +207,17 @@ pub fn run() -> windows::core::Result<()> {
         let (tx, rx) = mpsc::channel();
         let refresh = readers::spawn_all(hwnd.0 as isize, tx);
         let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
+        // A game going fullscreen changes the foreground: re-check right away
+        // instead of waiting for the 1 s timer. Lives as long as the process.
+        SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            None,
+            Some(on_location_change),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        );
         OWNER.store(hwnd.0 as isize, std::sync::atomic::Ordering::Relaxed);
         let hook = hook_taskbar_moves(None);
         APP.with(|cell| {
@@ -216,4 +236,19 @@ pub fn run() -> windows::core::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn take_app_while_borrowed_does_not_panic() {
+        // WM_DESTROY can arrive while a handler still holds APP (DestroyWindow
+        // from inside the tray menu); dropping state must not panic there.
+        APP.with(|cell| {
+            let _held = cell.borrow_mut();
+            assert!(take_app().is_none());
+        });
+    }
 }

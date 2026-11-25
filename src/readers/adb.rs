@@ -62,26 +62,59 @@ pub fn adb_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("adb"))
 }
 
+/// How an adb invocation ended.
+#[derive(Debug, PartialEq)]
+pub enum AdbRun {
+    Done(String),
+    /// Hit the deadline and was killed (e.g. the phone left the Wi-Fi mid-call).
+    TimedOut,
+    /// Could not start, or exited with an error.
+    Failed,
+}
+
+impl AdbRun {
+    fn output(self) -> Option<String> {
+        match self {
+            AdbRun::Done(out) => Some(out),
+            _ => None,
+        }
+    }
+}
+
+/// `dumpsys battery` result → outcome. A timeout means the phone is gone,
+/// so it counts as disconnected (hidden after the hold), not as "sem leitura".
+pub fn shell_outcome(run: AdbRun) -> ReadOutcome {
+    match run {
+        AdbRun::Done(out) => parse_dumpsys(&out).map_or(ReadOutcome::Failed, ReadOutcome::Ok),
+        AdbRun::TimedOut => ReadOutcome::Offline,
+        AdbRun::Failed => ReadOutcome::Failed,
+    }
+}
+
 /// Runs adb without a console window; gives up (and kills it) after 15 s.
-fn run_adb(args: &[&str]) -> Option<String> {
+fn run_adb(args: &[&str]) -> AdbRun {
     let mut cmd = Command::new(adb_path());
     cmd.args(args);
     run_with_timeout(cmd, ADB_TIMEOUT)
 }
 
 /// Runs `cmd` hidden and returns its stdout if it exits successfully within `timeout`.
-fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Option<String> {
-    let mut child = cmd
+fn run_with_timeout(mut cmd: Command, timeout: Duration) -> AdbRun {
+    let Ok(mut child) = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
-        .ok()?;
+    else {
+        return AdbRun::Failed;
+    };
     // Drain stdout on another thread so a chatty adb can't block on a full pipe.
     // A grandchild (the adb server on a cold start) may keep the pipe open
     // forever, so the deadline below also bounds waiting for this output.
-    let mut stdout = child.stdout.take()?;
+    let Some(mut stdout) = child.stdout.take() else {
+        return AdbRun::Failed;
+    };
     let (out_tx, out_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut out = String::new();
@@ -96,14 +129,17 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Option<String> {
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                return AdbRun::TimedOut;
             }
         }
     };
     if !status.success() {
-        return None;
+        return AdbRun::Failed;
     }
-    out_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).ok()
+    match out_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(out) => AdbRun::Done(out),
+        Err(_) => AdbRun::TimedOut,
+    }
 }
 
 /// Starts the adb server detached from any pipe of ours (all stdio null), so it
@@ -129,7 +165,7 @@ fn ensure_server() {
 }
 
 fn ready_serials() -> Option<Vec<String>> {
-    run_adb(&["devices"]).map(|out| parse_ready_serials(&out))
+    run_adb(&["devices"]).output().map(|out| parse_ready_serials(&out))
 }
 
 pub fn read_once() -> ReadOutcome {
@@ -140,6 +176,7 @@ pub fn read_once() -> ReadOutcome {
     if serials.is_empty() {
         // Wireless debugging changes port when the phone restarts: rediscover it.
         let targets = run_adb(&["mdns", "services"])
+            .output()
             .map(|out| parse_mdns_connect_targets(&out))
             .unwrap_or_default();
         for target in &targets {
@@ -150,10 +187,13 @@ pub fn read_once() -> ReadOutcome {
     let Some(serial) = serials.first() else {
         return ReadOutcome::Offline;
     };
-    match run_adb(&["-s", serial, "shell", "dumpsys", "battery"]).as_deref().and_then(parse_dumpsys) {
-        Some(reading) => ReadOutcome::Ok(reading),
-        None => ReadOutcome::Failed,
+    let run = run_adb(&["-s", serial, "shell", "dumpsys", "battery"]);
+    if run == AdbRun::TimedOut {
+        // Drop the dead connection so the next cycle rediscovers the phone
+        // instead of waiting 15 s on it again.
+        let _ = run_adb(&["disconnect", serial]);
     }
+    shell_outcome(run)
 }
 
 #[cfg(test)]
@@ -169,6 +209,25 @@ mod tests {
         let t = Instant::now();
         let _ = run_with_timeout(cmd, Duration::from_secs(2));
         assert!(t.elapsed() < Duration::from_secs(5), "took {:?}", t.elapsed());
+    }
+
+    #[test]
+    fn shell_timeout_means_phone_left() {
+        assert_eq!(shell_outcome(AdbRun::TimedOut), ReadOutcome::Offline);
+    }
+
+    #[test]
+    fn shell_error_or_garbage_is_failed() {
+        assert_eq!(shell_outcome(AdbRun::Failed), ReadOutcome::Failed);
+        assert_eq!(shell_outcome(AdbRun::Done("error: closed".into())), ReadOutcome::Failed);
+    }
+
+    #[test]
+    fn shell_dumpsys_is_ok() {
+        let out = AdbRun::Done("  status: 3
+  level: 42
+".into());
+        assert_eq!(shell_outcome(out), ReadOutcome::Ok(Reading { percent: 42, charge: Charge::Discharging }));
     }
 
     #[test]
