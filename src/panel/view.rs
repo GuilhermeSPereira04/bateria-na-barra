@@ -40,6 +40,14 @@ pub enum Key {
     Enter,
 }
 
+/// A bar that is clicked or dragged to set a value (0..=100).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)] // Volume is wired by the audio menu
+pub enum SliderKind {
+    Transparency,
+    Volume,
+}
+
 /// A clickable area of the panel.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Hit {
@@ -66,6 +74,7 @@ pub enum Hit {
     Accent(usize),
     AccentWindows,
     Tint(usize),
+    Slider(SliderKind),
     Result(usize),
 }
 
@@ -90,4 +99,6 @@ pub struct PanelView {
     pub gear_open: bool,
     pub audio_list: Option<Vec<String>>,
     pub hover: Option<Hit>,
+    /// The acrylic backdrop is on: the tint comes from it, not from the drawing.
+    pub acrylic: bool,
 }

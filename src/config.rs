@@ -34,11 +34,16 @@ impl GlassTint {
 pub struct Config {
     pub accent: Accent,
     pub tint: GlassTint,
+    /// 0..=100: how much of the desktop shows through the glass.
+    pub transparency: u8,
 }
+
+/// Transparency used when the file has none (or garbage).
+pub const DEFAULT_TRANSPARENCY: u8 = 45;
 
 impl Default for Config {
     fn default() -> Self {
-        Self { accent: Accent::Preset(0), tint: GlassTint::Dark }
+        Self { accent: Accent::Preset(0), tint: GlassTint::Dark, transparency: DEFAULT_TRANSPARENCY }
     }
 }
 
@@ -47,12 +52,14 @@ impl Default for Config {
 pub struct Colors {
     /// RGB of buttons that are on, bars, the active tab and today.
     pub accent: u32,
-    /// RGB and opacity of the layer painted over the glass.
+    /// RGB and opacity of the acrylic tint (opacity = 1 - transparency).
     pub tint: (u32, f32),
     /// What the accent came from, so the gear row can mark the selection.
     pub accent_choice: Accent,
     /// Which tint chip is selected.
     pub tint_choice: GlassTint,
+    /// 0..=100, as saved.
+    pub transparency: u8,
 }
 
 impl Default for Colors {
@@ -97,12 +104,13 @@ fn resolve_with(c: &Config, windows: u32) -> Colors {
         Accent::Windows => windows,
         Accent::Custom(rgb) => rgb,
     };
-    let tint = match c.tint {
-        GlassTint::Dark => (0x000000, 0.25),
-        GlassTint::Light => (0xFFFFFF, 0.18),
-        GlassTint::Accent => (accent, 0.15),
+    let rgb = match c.tint {
+        GlassTint::Dark => 0x20242C,
+        GlassTint::Light => 0xF3F3F3,
+        GlassTint::Accent => accent,
     };
-    Colors { accent, tint, accent_choice: c.accent, tint_choice: c.tint }
+    let alpha = (100 - c.transparency.min(100)) as f32 / 100.0;
+    Colors { accent, tint: (rgb, alpha), accent_choice: c.accent, tint_choice: c.tint, transparency: c.transparency.min(100) }
 }
 
 fn parse_accent(v: &str) -> Option<Accent> {
@@ -114,6 +122,11 @@ fn parse_accent(v: &str) -> Option<Accent> {
     }
     let hex = v.strip_prefix('#')?;
     (hex.len() == 6).then(|| u32::from_str_radix(hex, 16).ok()).flatten().map(Accent::Custom)
+}
+
+/// A number, limited to 0..=100.
+fn parse_transparency(v: &str) -> Option<u8> {
+    v.parse::<i64>().ok().map(|n| n.clamp(0, 100) as u8)
 }
 
 fn parse_tint(v: &str) -> Option<GlassTint> {
@@ -135,6 +148,7 @@ pub fn parse(text: &str) -> Config {
         match k {
             "accent" => c.accent = parse_accent(v).unwrap_or(c.accent),
             "tint" => c.tint = parse_tint(v).unwrap_or(c.tint),
+            "transparency" => c.transparency = parse_transparency(v).unwrap_or(c.transparency),
             _ => {}
         }
     }
@@ -165,7 +179,7 @@ pub fn serialize(c: &Config) -> String {
         GlassTint::Light => "light",
         GlassTint::Accent => "accent",
     };
-    format!("accent={accent}\ntint={tint}\n")
+    format!("accent={accent}\ntint={tint}\ntransparency={}\n", c.transparency.min(100))
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -200,9 +214,9 @@ mod tests {
     #[test]
     fn roundtrip() {
         for c in [
-            Config { accent: Accent::Preset(3), tint: GlassTint::Light },
-            Config { accent: Accent::Windows, tint: GlassTint::Dark },
-            Config { accent: Accent::Custom(0xFF8800), tint: GlassTint::Accent },
+            Config { accent: Accent::Preset(3), tint: GlassTint::Light, transparency: 0 },
+            Config { accent: Accent::Windows, tint: GlassTint::Dark, transparency: 45 },
+            Config { accent: Accent::Custom(0xFF8800), tint: GlassTint::Accent, transparency: 100 },
         ] {
             assert_eq!(parse(&serialize(&c)), c);
         }
@@ -222,18 +236,43 @@ mod tests {
     }
 
     #[test]
+    fn transparency_roundtrip() {
+        for t in [0, 45, 100] {
+            let c = Config { transparency: t, ..Config::default() };
+            assert_eq!(parse(&serialize(&c)).transparency, t);
+        }
+    }
+
+    #[test]
+    fn transparency_clamps_and_defaults() {
+        assert_eq!(parse("transparency=150").transparency, 100);
+        assert_eq!(parse("transparency=-3").transparency, 0);
+        assert_eq!(parse("transparency=abc").transparency, 45);
+        assert_eq!(parse("accent=windows").transparency, 45);
+    }
+
+    #[test]
+    fn alpha_from_transparency() {
+        let c = resolve_with(&Config::default(), 0);
+        assert_eq!(c.tint.1, 0.55);
+        assert_eq!(c.transparency, 45);
+        let full = resolve_with(&Config { transparency: 100, ..Config::default() }, 0);
+        assert_eq!(full.tint.1, 0.0);
+    }
+
+    #[test]
     fn abgr_to_rgb_swaps_channels() {
         assert_eq!(abgr_to_rgb(0xFF332211), 0x112233);
     }
 
     #[test]
     fn resolve_tints() {
-        let c = |tint| resolve_with(&Config { accent: Accent::Preset(1), tint }, 0);
-        assert_eq!(c(GlassTint::Dark).tint, (0x000000, 0.25));
-        assert_eq!(c(GlassTint::Light).tint, (0xFFFFFF, 0.18));
-        assert_eq!(c(GlassTint::Accent).tint, (0x60CDFF, 0.15));
-        let w = resolve_with(&Config { accent: Accent::Windows, tint: GlassTint::Accent }, 0x123456);
-        assert_eq!((w.accent, w.tint), (0x123456, (0x123456, 0.15)));
+        let c = |tint| resolve_with(&Config { accent: Accent::Preset(1), tint, ..Config::default() }, 0);
+        assert_eq!(c(GlassTint::Dark).tint, (0x20242C, 0.55));
+        assert_eq!(c(GlassTint::Light).tint, (0xF3F3F3, 0.55));
+        assert_eq!(c(GlassTint::Accent).tint, (0x60CDFF, 0.55));
+        let w = resolve_with(&Config { accent: Accent::Windows, tint: GlassTint::Accent, ..Config::default() }, 0x123456);
+        assert_eq!((w.accent, w.tint), (0x123456, (0x123456, 0.55)));
         assert_eq!(w.accent_choice, Accent::Windows);
     }
 
@@ -242,7 +281,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("battery-bar-test-{}", std::process::id()));
         let path = dir.join("sub").join("config");
         assert_eq!(load_from(&path), Config::default());
-        let c = Config { accent: Accent::Custom(0x0A0B0C), tint: GlassTint::Light };
+        let c = Config { accent: Accent::Custom(0x0A0B0C), tint: GlassTint::Light, transparency: 70 };
         save_to(&path, &c).unwrap();
         assert_eq!(load_from(&path), c);
         let _ = std::fs::remove_dir_all(&dir);

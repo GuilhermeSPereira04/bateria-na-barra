@@ -1,7 +1,7 @@
 //! Where each part of the panel goes, in physical pixels (pure).
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 
-use super::view::{Hit, PanelView, Tab};
+use super::view::{Hit, PanelView, SliderKind, Tab};
 
 pub struct Layout {
     pub size: (f32, f32),
@@ -33,6 +33,9 @@ const MEDIA_BTN: f32 = 36.0;
 const TABS_H: f32 = 28.0;
 const TAB_W: f32 = 96.0;
 const BODY_H: f32 = 220.0;
+/// Transparency row: the label's width and the bar's.
+pub const SLIDER_LABEL_W: f32 = 128.0;
+const SLIDER_W: f32 = 360.0;
 /// Fits "Usar a cor do Windows" with room on both sides; the gear row then
 /// takes 716 of the 728 DIP available.
 const ACCENT_WINDOWS_W: f32 = 172.0;
@@ -72,6 +75,9 @@ pub fn layout(view: &PanelView) -> Layout {
             regions.push((r(x, y, 80.0, COLOR_ROW_H), Hit::Tint(i)));
             x += 80.0 + GAP;
         }
+        y += COLOR_ROW_H + GAP;
+        // Transparency row: label, bar and value.
+        regions.push((r(PAD + SLIDER_LABEL_W, y, SLIDER_W, COLOR_ROW_H), Hit::Slider(SliderKind::Transparency)));
         y += COLOR_ROW_H + GAP;
     }
 
@@ -136,6 +142,15 @@ impl Layout {
     pub fn rect(&self, hit: Hit) -> Option<D2D_RECT_F> {
         self.regions.iter().find(|(_, h)| *h == hit).map(|(r, _)| *r)
     }
+}
+
+/// The value (0 at the left edge of `track`, 100 at the right, limited) under `x`.
+pub fn slider_value(track: D2D_RECT_F, x: f32) -> u8 {
+    let w = track.right - track.left;
+    if w <= 0.0 {
+        return 0;
+    }
+    (((x - track.left) / w).clamp(0.0, 1.0) * 100.0).round() as u8
 }
 
 pub fn hit_test(l: &Layout, x: f32, y: f32) -> Option<Hit> {
@@ -230,7 +245,19 @@ mod tests {
         }
         assert!(has(&open, Hit::AccentWindows));
         assert!(!has(&closed, Hit::Accent(0)) && !has(&closed, Hit::AccentWindows));
-        assert_eq!(open.size.1, closed.size.1 + 40.0);
+        assert!(has(&open, Hit::Slider(SliderKind::Transparency)));
+        assert!(!has(&closed, Hit::Slider(SliderKind::Transparency)));
+        assert_eq!(open.size.1, closed.size.1 + 80.0);
+    }
+
+    #[test]
+    fn slider_value_maps_the_track() {
+        let t = D2D_RECT_F { left: 100.0, top: 0.0, right: 300.0, bottom: 20.0 };
+        assert_eq!(slider_value(t, 100.0), 0);
+        assert_eq!(slider_value(t, 300.0), 100);
+        assert_eq!(slider_value(t, 200.0), 50);
+        assert_eq!(slider_value(t, -50.0), 0);
+        assert_eq!(slider_value(t, 900.0), 100);
     }
 
     #[test]

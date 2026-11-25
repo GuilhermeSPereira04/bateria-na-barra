@@ -22,9 +22,9 @@ use crate::media::{self, MediaCmd, NowPlaying};
 use crate::model::{ALL, DeviceKind, ReadOutcome, Tracker};
 use crate::panel::trigger::{CloseRule, EdgeTrigger, Pauses, click_outside_closes, new_press};
 use crate::panel::layout::MAX_ROWS;
-use crate::panel::view::{Hit, Key, PanelView, QuickState, Tab, Toggle};
+use crate::panel::view::{Hit, Key, PanelView, QuickState, SliderKind, Tab, Toggle};
 use crate::panel::{
-    ASYNC_APPS, ASYNC_AUDIO, ASYNC_MEDIA, ASYNC_RADIOS, ASYNC_SPEED, ASYNC_STATS, PanelWindow, WM_PANEL_ASYNC, WM_PANEL_CLOSED, WM_PANEL_HIT, WM_PANEL_KEY, WM_PANEL_WHEEL,
+    ASYNC_APPS, ASYNC_AUDIO, ASYNC_MEDIA, ASYNC_RADIOS, ASYNC_SPEED, ASYNC_STATS, PanelWindow, WM_PANEL_ASYNC, WM_PANEL_CLOSED, WM_PANEL_DRAG, WM_PANEL_HIT, WM_PANEL_KEY, WM_PANEL_WHEEL,
 };
 use crate::readers::{self, WM_READING};
 use crate::radios::{self, RadioKind, RadioSnapshot};
@@ -118,6 +118,8 @@ struct App {
     button_was_down: bool,
     tab: Tab,
     gear_open: bool,
+    /// A bar is being dragged (pauses the close rule).
+    dragging: bool,
     /// Month shown on the calendar tab (year, 1..=12).
     month: (i32, u32),
     config: Config,
@@ -200,6 +202,7 @@ impl App {
         self.tab = Tab::Resources;
         self.sort_ram = false;
         self.gear_open = false;
+        self.dragging = false;
         let (year, month, _) = today();
         self.month = (year, month);
         self.audio_list_open = false;
@@ -540,6 +543,22 @@ impl App {
         self.colors = config::resolve(&config);
     }
 
+    /// A bar was clicked or dragged to `value`; `last` when the button was released.
+    fn on_drag(&mut self, kind: SliderKind, value: u8, last: bool) {
+        self.dragging = !last;
+        match kind {
+            SliderKind::Transparency => {
+                self.config.transparency = value.min(100);
+                self.colors = config::resolve(&self.config);
+                if last {
+                    config::save(&self.config);
+                }
+            }
+            SliderKind::Volume => {}
+        }
+        self.refresh_panel();
+    }
+
     fn close_panel(&mut self) {
         if self.panel.is_none() {
             return;
@@ -606,6 +625,7 @@ impl App {
             search_text: !self.query.is_empty(),
             speedtest_running: matches!(self.speed, SpeedState::Running { .. }),
             popup_open: self.gear_open || self.audio_list_open,
+            dragging: self.dragging,
         };
         if self.close.update(inside, pauses, now) {
             self.close_panel();
@@ -658,6 +678,12 @@ unsafe extern "system" fn owner_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 app.open_panel(hwnd);
             } else {
                 app.close_panel();
+            }
+        }),
+        WM_PANEL_DRAG => with_app(|app| {
+            let drags = app.panel.as_ref().map(|p| p.take_drags()).unwrap_or_default();
+            for (kind, value, last) in drags {
+                app.on_drag(kind, value, last);
             }
         }),
         WM_PANEL_HIT => with_app(|app| {
@@ -788,6 +814,7 @@ pub fn run() -> windows::core::Result<()> {
                 button_was_down: false,
                 tab: Tab::Resources,
                 gear_open: false,
+                dragging: false,
                 month: (0, 1),
                 config: Config::default(),
                 colors: Colors::default(),

@@ -68,11 +68,13 @@ pub struct Pauses {
     pub search_text: bool,
     pub speedtest_running: bool,
     pub popup_open: bool,
+    /// A bar is being dragged (the mouse may leave the panel meanwhile).
+    pub dragging: bool,
 }
 
 impl Pauses {
     fn any(&self) -> bool {
-        self.search_text || self.speedtest_running || self.popup_open
+        self.search_text || self.speedtest_running || self.popup_open || self.dragging
     }
 }
 
@@ -227,6 +229,20 @@ mod tests {
         assert!(!c.update(false, p, t0 + ms(4000)));
         assert!(!c.update(false, Pauses::default(), t0 + ms(4100)));
         assert!(!c.update(false, Pauses::default(), t0 + ms(4500)));
+        assert!(c.update(false, Pauses::default(), t0 + ms(4600)));
+    }
+
+    #[test]
+    fn drag_pauses_close() {
+        let t0 = Instant::now();
+        let mut c = CloseRule::new();
+        let drag = Pauses { dragging: true, ..Pauses::default() };
+        c.update(true, Pauses::default(), t0);
+        assert!(!c.update(false, drag, t0 + ms(1000)));
+        assert!(!c.update(false, drag, t0 + ms(4000)));
+        // Released outside: closes 0.5 s later.
+        assert!(!c.update(false, Pauses::default(), t0 + ms(4100)));
+        assert!(!c.update(false, Pauses::default(), t0 + ms(4599)));
         assert!(c.update(false, Pauses::default(), t0 + ms(4600)));
     }
 }

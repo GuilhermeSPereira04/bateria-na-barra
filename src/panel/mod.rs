@@ -2,6 +2,7 @@
 //! drawn over with Direct2D. Created on open and destroyed on close, so no
 //! drawing resources stay allocated while it is closed.
 pub mod draw;
+pub mod glass;
 pub mod layout;
 pub mod trigger;
 pub mod view;
@@ -13,7 +14,7 @@ use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dwm::{
-    DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DWMSBT_NONE, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
     DWMWCP_ROUND, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -25,13 +26,13 @@ use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentProcessId, 
 use windows::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY, VK_BACK, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_UP,
+    ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY, VK_BACK, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
 
 use layout::{Layout, hit_test};
-use view::{Hit, Key, PanelView};
+use view::{Hit, Key, PanelView, SliderKind};
 
 /// Posted to the owner by panel worker threads when new data is ready
 /// (wParam: which source, see `ASYNC_*`).
@@ -60,6 +61,10 @@ pub const WM_PANEL_KEY: u32 = WM_APP + 13;
 /// Posted to the owner after the wheel turned over the audio toggle; the
 /// owner collects the notches with `PanelWindow::take_wheel`. wParam: the panel's HWND.
 pub const WM_PANEL_WHEEL: u32 = WM_APP + 14;
+
+/// Posted to the owner while a bar is dragged; the owner collects the values
+/// with `PanelWindow::take_drags`. wParam: the panel's HWND.
+pub const WM_PANEL_DRAG: u32 = WM_APP + 21;
 
 /// Whole wheel notches in an accumulated `WM_MOUSEWHEEL` delta, and the rest
 /// (fine-grained wheels and touchpads send fractions of a notch).
@@ -130,6 +135,12 @@ struct Shared {
     wheel: Cell<i32>,
     /// `TrackMouseEvent` is armed (a `WM_MOUSELEAVE` will come).
     tracking: Cell<bool>,
+    /// The bar being dragged (the mouse is captured) and its last value.
+    drag: Cell<Option<(SliderKind, u8)>>,
+    /// Bar values since the owner last looked: (bar, value, button released).
+    drags: RefCell<Vec<(SliderKind, u8, bool)>>,
+    /// The acrylic backdrop is on, and the (rgb, alpha) it was applied with.
+    glass: Cell<Option<(u32, f32)>>,
 }
 
 fn invalidate(hwnd: HWND) {
@@ -200,6 +211,42 @@ impl Shared {
         });
         if changed {
             invalidate(hwnd);
+        }
+    }
+
+    /// The value of bar `kind` for a pointer at client `x`.
+    fn slider_at(&self, kind: SliderKind, x: f32) -> Option<u8> {
+        let scene = self.scene.try_borrow().ok()?;
+        scene.layout.rect(Hit::Slider(kind)).map(|track| layout::slider_value(track, x))
+    }
+
+    /// Queues a bar value for the owner. A move replaces a pending move of the same bar.
+    fn push_drag(&self, hwnd: HWND, kind: SliderKind, value: u8, last: bool) {
+        if let Ok(mut q) = self.drags.try_borrow_mut() {
+            if !last && matches!(q.last(), Some((k, _, false)) if *k == kind) {
+                q.pop();
+            }
+            q.push((kind, value, last));
+            post_owner(hwnd, WM_PANEL_DRAG);
+        }
+    }
+
+    /// Turns the acrylic on for `tint` (or updates it); false keeps the system backdrop.
+    fn apply_glass(&self, hwnd: HWND, tint: (u32, f32)) {
+        if self.glass.get() == Some(tint) {
+            return;
+        }
+        if glass::apply(hwnd, tint.0, tint.1) {
+            if self.glass.get().is_none() {
+                unsafe {
+                    let none = DWMSBT_NONE.0;
+                    let _ = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &none as *const i32 as _, size_of::<i32>() as u32);
+                }
+            }
+            self.glass.set(Some(tint));
+            if let Ok(mut scene) = self.scene.try_borrow_mut() {
+                scene.view.acrylic = true;
+            }
         }
     }
 
@@ -298,6 +345,32 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                     shared.tracking.set(unsafe { TrackMouseEvent(&mut tme) }.is_ok());
                 }
                 shared.set_hover(hwnd, shared.hit_at(lp));
+                if let Some((kind, _)) = shared.drag.get()
+                    && let Some(v) = shared.slider_at(kind, (lp.0 & 0xFFFF) as i16 as f32)
+                {
+                    shared.drag.set(Some((kind, v)));
+                    shared.push_drag(hwnd, kind, v, false);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            if let Some(shared) = shared
+                && let Some(Hit::Slider(kind)) = shared.hit_at(lp)
+                && let Some(v) = shared.slider_at(kind, (lp.0 & 0xFFFF) as i16 as f32)
+            {
+                unsafe { SetCapture(hwnd) };
+                shared.drag.set(Some((kind, v)));
+                shared.push_drag(hwnd, kind, v, false);
+            }
+            LRESULT(0)
+        }
+        // Capture lost without a release (another window took it): end the drag.
+        WM_CAPTURECHANGED => {
+            if let Some(shared) = shared
+                && let Some((kind, v)) = shared.drag.take()
+            {
+                shared.push_drag(hwnd, kind, v, true);
             }
             LRESULT(0)
         }
@@ -310,6 +383,14 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         }
         // Handled by the owner, outside this window procedure: a click may close the panel.
         WM_LBUTTONUP => {
+            if let Some(shared) = shared
+                && let Some((kind, _)) = shared.drag.take()
+            {
+                let v = shared.slider_at(kind, (lp.0 & 0xFFFF) as i16 as f32).unwrap_or(0);
+                shared.push_drag(hwnd, kind, v, true);
+                let _ = unsafe { ReleaseCapture() };
+                return LRESULT(0); // a drag is not a click
+            }
             if let Some(shared) = shared
                 && let Some(hit) = shared.hit_at(lp)
             {
@@ -446,6 +527,9 @@ impl PanelWindow {
                 keys: RefCell::new(Vec::new()),
                 wheel: Cell::new(0),
                 tracking: Cell::new(false),
+                drag: Cell::new(None),
+                drags: RefCell::new(Vec::new()),
+                glass: Cell::new(None),
             });
             // No WS_EX_LAYERED: it would block the system backdrop.
             let hwnd = CreateWindowExW(
@@ -473,6 +557,9 @@ impl PanelWindow {
             let margins = MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 };
             let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
 
+            // Acrylic with the chosen tint; the system backdrop stays if that fails.
+            shared.apply_glass(hwnd, shared.scene.try_borrow().map(|s| s.view.colors.tint).unwrap_or((0x20242C, 0.55)));
+
             let previous = GetForegroundWindow();
             let _ = ShowWindow(hwnd, SW_SHOW);
             take_focus(hwnd, previous);
@@ -489,10 +576,12 @@ impl PanelWindow {
     /// Shows `view` (drawn on the next `WM_PAINT`), resizing the window if its
     /// layout changed size. The panel keeps its own `dpi` and `hover`.
     pub fn redraw(&mut self, view: PanelView) {
+        let tint = view.colors.tint;
         self.shared.update(self.hwnd, move |current| {
-            let (dpi, hover) = (current.dpi, current.hover);
-            *current = PanelView { dpi, hover, ..view };
+            let (dpi, hover, acrylic) = (current.dpi, current.hover, current.acrylic);
+            *current = PanelView { dpi, hover, acrylic, ..view };
         });
+        self.shared.apply_glass(self.hwnd, tint);
     }
 
     /// Don't give the focus back on close: an app launched from the panel is
@@ -512,6 +601,12 @@ impl PanelWindow {
         let (notches, rest) = wheel_notches(self.shared.wheel.get());
         self.shared.wheel.set(rest);
         notches
+    }
+
+    /// The bar values announced by the last `WM_PANEL_DRAG`, in order:
+    /// (bar, value, button released).
+    pub fn take_drags(&self) -> Vec<(SliderKind, u8, bool)> {
+        self.shared.drags.try_borrow_mut().map(|mut d| std::mem::take(&mut *d)).unwrap_or_default()
     }
 
     /// The keys announced by the last `WM_PANEL_KEY`, in typing order.

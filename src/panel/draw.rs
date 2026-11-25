@@ -6,8 +6,8 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::core::PCWSTR;
 use windows_numerics::Vector2;
 
-use super::layout::{INSET, Layout, MAX_ROWS, ROW_H, scale};
-use super::view::{Hit, PanelView, Tab, Toggle};
+use super::layout::{INSET, Layout, MAX_ROWS, ROW_H, SLIDER_LABEL_W, scale};
+use super::view::{Hit, PanelView, SliderKind, Tab, Toggle};
 use crate::apps::AppEntry;
 use crate::config::{ACCENTS, Accent, Colors, GlassTint};
 use crate::media::COVER_PX;
@@ -248,9 +248,13 @@ pub fn draw(rt: &ID2D1RenderTarget, dw: &IDWriteFactory, cache: &mut Cache, view
     // ClearType can't blend onto transparent pixels.
     unsafe { rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE) };
 
-    let (tint, alpha) = view.colors.tint;
-    p.color(rgb(tint, alpha));
-    unsafe { rt.FillRectangle(&rect(0.0, 0.0, layout.size.0, layout.size.1), brush) };
+    // With the acrylic backdrop the tint comes from the system; without it
+    // (fallback) paint a milder layer over the plain backdrop.
+    if !view.acrylic {
+        let (tint, alpha) = view.colors.tint;
+        p.color(rgb(tint, alpha * 0.5));
+        unsafe { rt.FillRectangle(&rect(0.0, 0.0, layout.size.0, layout.size.1), brush) };
+    }
 
     search(&p, view, layout);
     if view.gear_open {
@@ -261,7 +265,7 @@ pub fn draw(rt: &ID2D1RenderTarget, dw: &IDWriteFactory, cache: &mut Cache, view
     media(&p, view, layout);
     lower(&p, view, layout);
 
-    if let Some(r) = view.hover.and_then(|h| layout.rect(h)) {
+    if let Some(r) = view.hover.filter(|h| !matches!(h, Hit::Slider(_))).and_then(|h| layout.rect(h)) {
         p.fill(r, white(HOVER));
     }
     Ok(())
@@ -301,6 +305,13 @@ fn colors_row(p: &Painter, colors: &Colors, l: &Layout) {
             p.text(ACCENT_WINDOWS, &p.f.text, r, Align::Center, white(0.92));
         }
     }
+    if let Some(track) = l.rect(Hit::Slider(SliderKind::Transparency)) {
+        let label = rect(track.left - p.px(SLIDER_LABEL_W), track.top, track.left - p.px(8.0), track.bottom);
+        p.text("Transparência", &p.f.text, label, Align::Left, white(0.92));
+        slider(p, track, colors.transparency, colors.accent);
+        let value = rect(track.right + p.px(14.0), track.top, track.right + p.px(64.0), track.bottom);
+        p.text(&format!("{}%", colors.transparency), &p.f.text, value, Align::Left, white(0.92));
+    }
     let selected = GlassTint::ALL.iter().position(|&t| t == colors.tint_choice);
     for (i, name) in ["Escuro", "Claro", "Destaque"].into_iter().enumerate() {
         let Some(r) = l.rect(Hit::Tint(i)) else { continue };
@@ -312,6 +323,23 @@ fn colors_row(p: &Painter, colors: &Colors, l: &Layout) {
             p.text(name, &p.f.text, r, Align::Center, white(0.92));
         }
     }
+}
+
+/// A bar: groove, the filled part in the accent color and the knob.
+fn slider(p: &Painter, track: D2D_RECT_F, value: u8, accent: u32) {
+    let cy = (track.top + track.bottom) / 2.0;
+    let half = p.px(2.0);
+    let x = track.left + (track.right - track.left) * f32::from(value.min(100)) / 100.0;
+    let groove = |right: f32, c: D2D1_COLOR_F| {
+        p.color(c);
+        let r = D2D_RECT_F { left: track.left, top: cy - half, right, bottom: cy + half };
+        unsafe { p.rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: half, radiusY: half }, p.brush) };
+    };
+    groove(track.right, white(0.22));
+    if x > track.left {
+        groove(x, rgb(accent, 1.0));
+    }
+    p.circle(x, cy, p.px(7.0), white(0.95), None);
 }
 
 fn quick(p: &Painter, view: &PanelView, l: &Layout) {
