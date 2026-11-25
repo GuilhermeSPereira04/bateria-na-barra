@@ -25,6 +25,7 @@ const ICON: f32 = 20.0;
 const COVER: f32 = 32.0;
 const COVER_INSET: f32 = 6.0;
 const TEXT: u32 = 0xFFFFFF;
+const TEXT_ON_LIGHT: u32 = 0x1B1B1B;
 const ERROR: u32 = 0xFF6B5E;
 /// Text over an accent fill (accents are light colors).
 const ON_ACCENT: u32 = 0x0E1A12;
@@ -166,8 +167,17 @@ fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
     D2D_RECT_F { left, top, right, bottom }
 }
 
+thread_local! {
+    static FOREGROUND: std::cell::Cell<u32> = const { std::cell::Cell::new(TEXT) };
+}
+
+/// Text / glyph / overlay color: white on the dark glass, near-black on the light one.
+pub fn foreground(tint: GlassTint) -> u32 {
+    if tint == GlassTint::Light { TEXT_ON_LIGHT } else { TEXT }
+}
+
 fn white(alpha: f32) -> D2D1_COLOR_F {
-    rgb(TEXT, alpha)
+    rgb(FOREGROUND.with(|f| f.get()), alpha)
 }
 
 impl Painter<'_> {
@@ -251,6 +261,7 @@ pub fn draw(rt: &ID2D1RenderTarget, dw: &IDWriteFactory, cache: &mut Cache, view
 
     // With the acrylic backdrop the tint comes from the system; without it
     // (fallback) paint a milder layer over the plain backdrop.
+    FOREGROUND.with(|f| f.set(foreground(view.colors.tint_choice)));
     if !view.acrylic {
         let (tint, alpha) = view.colors.tint;
         p.color(rgb(tint, alpha * 0.5));
@@ -505,7 +516,8 @@ fn lower(p: &Painter, view: &PanelView, l: &Layout) {
 fn audio_menu(p: &Painter, view: &PanelView, menu: &AudioMenu, l: &Layout) {
     let Some(card) = l.menu else { return };
     // Mostly opaque so it reads over whatever is below.
-    p.color(rgb(0x20242C, 0.85));
+    let light = view.colors.tint_choice == GlassTint::Light;
+    p.color(if light { rgb(0xF3F3F3, 0.92) } else { rgb(0x20242C, 0.85) });
     let radius = p.px(RADIUS);
     unsafe { p.rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: card, radiusX: radius, radiusY: radius }, p.brush) };
     p.fill(card, white(0.12));
@@ -807,6 +819,23 @@ mod tests {
             assert!(alpha(2, 2) > 0, "tint");
             assert!(alpha((100.0 * s) as i32, (20.0 * s) as i32) > alpha(2, 2), "search card");
         }
+    }
+
+    #[test]
+    fn light_tint_uses_dark_foreground() {
+        assert_eq!(foreground(GlassTint::Dark), 0xFFFFFF);
+        assert_eq!(foreground(GlassTint::Accent), 0xFFFFFF);
+        assert_eq!(foreground(GlassTint::Light), 0x1B1B1B);
+        // Drawing with the light tint leaves the thread-local dark; a dark draw resets it.
+        let mut cache = Cache::new();
+        let mut view = full_view(96);
+        view.colors.tint_choice = GlassTint::Light;
+        view.colors.tint = (0xF3F3F3, 0.55);
+        render(&view, &mut cache).1.unwrap();
+        assert_eq!(white(1.0).r, 0x1B as f32 / 255.0);
+        view.colors.tint_choice = GlassTint::Dark;
+        render(&view, &mut cache).1.unwrap();
+        assert_eq!(white(1.0).r, 1.0);
     }
 
     #[test]

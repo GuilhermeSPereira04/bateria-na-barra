@@ -76,6 +76,8 @@ pub enum Hit {
     Slider(SliderKind),
     /// A click on the panel where nothing is clickable.
     Blank,
+    /// Inside the audio drop-down but not on a control: keeps it open.
+    MenuBody,
     Result(usize),
 }
 

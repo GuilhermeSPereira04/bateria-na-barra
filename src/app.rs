@@ -506,7 +506,7 @@ impl App {
     /// A click on the panel. The other hits are wired by the tasks that give them data.
     fn on_hit(&mut self, hwnd: HWND, hit: Hit) {
         // With the audio list open a click elsewhere only closes the list.
-        if self.audio_list_open && !matches!(hit, Hit::AudioDevice(_) | Hit::AudioMore) {
+        if self.audio_list_open && !matches!(hit, Hit::AudioDevice(_) | Hit::AudioMore | Hit::MenuBody) {
             self.audio_list_open = false;
             return self.refresh_panel();
         }

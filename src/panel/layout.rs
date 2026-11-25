@@ -153,7 +153,7 @@ pub fn layout(view: &PanelView) -> Layout {
         }
         // The rest of the card takes clicks so they don't fall through to what is under it.
         let card = r(audio_x, menu_top, MENU_W, MENU_BAR_H + count as f32 * ROW_H);
-        menu_regions.push((card, Hit::Blank));
+        menu_regions.push((card, Hit::MenuBody));
         regions.splice(0..0, menu_regions);
         card
     });
