@@ -15,6 +15,8 @@ pub struct Layout {
     #[allow(dead_code)] // the tabs are drawn from their regions
     pub tabs: D2D_RECT_F,
     pub body: D2D_RECT_F,
+    /// The audio drop-down's card, drawn over the rest.
+    pub menu: Option<D2D_RECT_F>,
 }
 
 // Base sizes in DIP (96 dpi).
@@ -42,6 +44,14 @@ const ACCENT_WINDOWS_W: f32 = 172.0;
 /// Height of a row in the results / output list.
 pub const ROW_H: f32 = 30.0;
 pub const MAX_ROWS: usize = 8;
+/// Most outputs the audio drop-down lists.
+pub const MAX_OUTPUTS: usize = 8;
+const MENU_W: f32 = 240.0;
+/// The drop-down's first row: the volume bar.
+const MENU_BAR_H: f32 = 36.0;
+/// Where the bar starts and how wide it is inside the first row (icon before, value after).
+pub const MENU_BAR_X: f32 = 40.0;
+const MENU_BAR_W: f32 = 144.0;
 /// Inner padding of the body card.
 pub const INSET: f32 = 12.0;
 
@@ -82,6 +92,8 @@ pub fn layout(view: &PanelView) -> Layout {
     }
 
     let quick_row = r(PAD, y, inner, QUICK_H);
+    let audio_x = PAD + 2.0 * (TOGGLE_W + GAP);
+    let menu_top = y + QUICK_H + GAP / 2.0;
     let mut x = PAD;
     for (main, more) in [(Hit::Wifi, Hit::WifiMore), (Hit::Bluetooth, Hit::BtMore), (Hit::Audio, Hit::AudioMore)] {
         regions.push((r(x, y, TOGGLE_W - ARROW_W, QUICK_H), main));
@@ -102,14 +114,9 @@ pub fn layout(view: &PanelView) -> Layout {
 
     // The lower part keeps one height in every mode, so typing doesn't resize the panel.
     let lower_h = TABS_H + GAP + BODY_H;
-    let list: Option<(usize, fn(usize) -> Hit)> = if !view.query.is_empty() {
-        Some((view.results.len(), Hit::Result))
-    } else {
-        view.audio_list.as_ref().map(|l| (l.len(), Hit::AudioDevice as fn(usize) -> Hit))
-    };
-    let (tabs, body) = if let Some((count, hit)) = list {
-        for i in 0..count.min(MAX_ROWS) {
-            regions.push((r(PAD, y + i as f32 * ROW_H, inner, ROW_H), hit(i)));
+    let (tabs, body) = if !view.query.is_empty() {
+        for i in 0..view.results.len().min(MAX_ROWS) {
+            regions.push((r(PAD, y + i as f32 * ROW_H, inner, ROW_H), Hit::Result(i)));
         }
         (r(PAD, y, inner, 0.0), r(PAD, y, inner, lower_h))
     } else {
@@ -134,7 +141,24 @@ pub fn layout(view: &PanelView) -> Layout {
     };
     y += lower_h + PAD;
 
-    Layout { size: (WIDTH * s, y * s), regions, search, quick_row, battery, media, tabs, body }
+    // The audio drop-down lies over the rest: its regions come first in hit tests.
+    let menu = view.audio_menu.as_ref().map(|m| {
+        let count = m.outputs.len().min(MAX_OUTPUTS);
+        let mut menu_regions = vec![(
+            r(audio_x + MENU_BAR_X, menu_top, MENU_BAR_W, MENU_BAR_H),
+            Hit::Slider(SliderKind::Volume),
+        )];
+        for i in 0..count {
+            menu_regions.push((r(audio_x, menu_top + MENU_BAR_H + i as f32 * ROW_H, MENU_W, ROW_H), Hit::AudioDevice(i)));
+        }
+        // The rest of the card takes clicks so they don't fall through to what is under it.
+        let card = r(audio_x, menu_top, MENU_W, MENU_BAR_H + count as f32 * ROW_H);
+        menu_regions.push((card, Hit::Blank));
+        regions.splice(0..0, menu_regions);
+        card
+    });
+
+    Layout { size: (WIDTH * s, y * s), regions, search, quick_row, battery, media, tabs, body, menu }
 }
 
 impl Layout {
@@ -161,6 +185,7 @@ pub fn hit_test(l: &Layout, x: f32, y: f32) -> Option<Hit> {
 mod tests {
     use super::*;
     use crate::apps::AppEntry;
+    use crate::panel::view::AudioMenu;
 
     fn at(dpi: u32) -> PanelView {
         PanelView { dpi, ..Default::default() }
@@ -200,7 +225,6 @@ mod tests {
             PanelView { tab: Tab::Calendar, ..at(144) },
             PanelView { tab: Tab::Speed, ..at(144) },
             PanelView { query: "a".into(), results: results(8), ..at(144) },
-            PanelView { audio_list: Some(vec!["Fone".into(), "Monitor".into()]), ..at(144) },
         ];
         for view in &views {
             let l = layout(view);
@@ -212,11 +236,56 @@ mod tests {
                 }
             }
         }
+        // The audio drop-down lies over the rest (so overlaps are expected) but fits in the panel.
+        for gear_open in [false, true] {
+            let view = PanelView { gear_open, audio_menu: Some(menu(MAX_OUTPUTS)), ..at(144) };
+            let l = layout(&view);
+            let card = l.menu.expect("menu card");
+            assert!(card.left >= 0.0 && card.top >= 0.0 && card.right <= l.size.0 && card.bottom <= l.size.1);
+            for (a, ha) in &l.regions {
+                assert!(a.right <= l.size.0 && a.bottom <= l.size.1, "{ha:?} outside");
+            }
+        }
         assert_eq!(layout(&at(144)).size.1, 444.0 * 1.5);
     }
 
     fn results(n: usize) -> Vec<AppEntry> {
         (0..n).map(|i| AppEntry { name: format!("App {i}"), id: format!("id{i}"), icon: None }).collect()
+    }
+
+    fn menu(n: usize) -> AudioMenu {
+        AudioMenu { outputs: (0..n).map(|i| format!("Saida {i}")).collect(), current: Some(0), volume: 50 }
+    }
+
+    #[test]
+    fn audio_menu_overlays_below_audio_card() {
+        let l = layout(&PanelView { audio_menu: Some(menu(2)), ..at(96) });
+        let card = l.menu.expect("menu card");
+        let audio = l.rect(Hit::Audio).expect("audio card");
+        assert!(card.top >= audio.bottom);
+        // Aligned with the audio card's left edge, 240 wide.
+        assert_eq!((card.left, card.right - card.left), (audio.left, 240.0));
+        // A point on row 0 lies over the tabs area and still hits the output.
+        let tabs = l.rect(Hit::Tab(Tab::Speed)).expect("tabs");
+        let row0 = l.rect(Hit::AudioDevice(0)).expect("row 0");
+        assert!(row0.top >= card.top + 36.0);
+        let (x, y) = ((row0.left + row0.right) / 2.0, row0.top + 2.0);
+        assert_eq!(hit_test(&l, x, y), Some(Hit::AudioDevice(0)));
+        assert!(overlap(&row0, &tabs), "the list is over the tabs");
+        assert!(has(&l, Hit::Tab(Tab::Resources)) && has(&l, Hit::Tab(Tab::Speed)));
+        assert!(has(&l, Hit::Slider(SliderKind::Volume)));
+        // The body no longer changes for audio.
+        assert_eq!(l.size, layout(&at(96)).size);
+    }
+
+    #[test]
+    fn audio_menu_caps_outputs() {
+        let l = layout(&PanelView { audio_menu: Some(menu(12)), ..at(96) });
+        assert!(has(&l, Hit::AudioDevice(0)) && has(&l, Hit::AudioDevice(7)));
+        assert!(!has(&l, Hit::AudioDevice(8)));
+        let l = layout(&PanelView { audio_menu: Some(menu(0)), ..at(96) });
+        assert!(has(&l, Hit::Slider(SliderKind::Volume)));
+        assert!(!l.regions.iter().any(|(_, h)| matches!(h, Hit::AudioDevice(_))));
     }
 
     #[test]

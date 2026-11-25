@@ -29,6 +29,8 @@ pub struct AudioSnapshot {
     pub output: Option<String>,
     /// Active outputs as (endpoint id, friendly name).
     pub outputs: Vec<(String, String)>,
+    /// Endpoint id of the default output.
+    pub default_id: Option<String>,
 }
 
 /// `current` moved by `delta` percentage points, kept within 0..=100.
@@ -45,6 +47,7 @@ pub fn snapshot_from(endpoint: Option<(bool, u8, String)>, outputs: Vec<(String,
             volume: volume.min(100),
             output: Some(name).filter(|n| !n.is_empty()),
             outputs,
+            default_id: None,
         },
     }
 }
@@ -146,7 +149,13 @@ fn outputs() -> Vec<(String, String)> {
 
 /// Reads everything (COM must be initialized on the calling thread).
 pub fn snapshot() -> AudioSnapshot {
-    snapshot_from(endpoint(), outputs())
+    AudioSnapshot { default_id: default_output().and_then(|d| id_of(&d)), ..snapshot_from(endpoint(), outputs()) }
+}
+
+/// Sets the default output's volume to `pct` (0..=100).
+pub fn set_volume(pct: u8) {
+    let Some(volume) = default_output().and_then(|d| volume_of(&d)) else { return };
+    let _ = unsafe { volume.SetMasterVolumeLevelScalar(f32::from(pct.min(100)) / 100.0, std::ptr::null()) };
 }
 
 /// Moves the default output's volume by `delta` percentage points.

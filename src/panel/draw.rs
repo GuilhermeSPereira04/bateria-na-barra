@@ -6,8 +6,8 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::core::PCWSTR;
 use windows_numerics::Vector2;
 
-use super::layout::{INSET, Layout, MAX_ROWS, ROW_H, SLIDER_LABEL_W, scale};
-use super::view::{Hit, PanelView, SliderKind, Tab, Toggle};
+use super::layout::{INSET, Layout, MAX_OUTPUTS, MAX_ROWS, ROW_H, SLIDER_LABEL_W, scale};
+use super::view::{AudioMenu, Hit, PanelView, SliderKind, Tab, Toggle};
 use crate::apps::AppEntry;
 use crate::config::{ACCENTS, Accent, Colors, GlassTint};
 use crate::media::COVER_PX;
@@ -34,6 +34,7 @@ const ACCENT_WINDOWS: &str = "Usar a cor do Windows";
 const GLYPH_SEARCH: char = '\u{E721}';
 const GLYPH_GEAR: char = '\u{E713}';
 const GLYPH_MORE: char = '\u{E70D}';
+const GLYPH_CHECK: char = '\u{E73E}';
 const GLYPH_VOLUME: char = '\u{E767}';
 const GLYPH_MUTE: char = '\u{E74F}';
 const GLYPH_PREV: char = '\u{E892}';
@@ -264,8 +265,11 @@ pub fn draw(rt: &ID2D1RenderTarget, dw: &IDWriteFactory, cache: &mut Cache, view
     battery(&p, view, layout);
     media(&p, view, layout);
     lower(&p, view, layout);
+    if let Some(menu) = &view.audio_menu {
+        audio_menu(&p, view, menu, layout);
+    }
 
-    if let Some(r) = view.hover.filter(|h| !matches!(h, Hit::Slider(_))).and_then(|h| layout.rect(h)) {
+    if let Some(r) = view.hover.filter(|h| !matches!(h, Hit::Slider(_) | Hit::Blank | Hit::AudioDevice(_))).and_then(|h| layout.rect(h)) {
         p.fill(r, white(HOVER));
     }
     Ok(())
@@ -478,11 +482,6 @@ fn lower(p: &Painter, view: &PanelView, l: &Layout) {
         rows(p, l, &items, Hit::Result, Some(view.selected), "Nada encontrado");
         return;
     }
-    if let Some(outputs) = &view.audio_list {
-        let items: Vec<(&str, Option<&ID2D1Bitmap>)> = outputs.iter().map(|o| (o.as_str(), None)).collect();
-        rows(p, l, &items, Hit::AudioDevice, None, "Nenhuma saída de áudio");
-        return;
-    }
     for (tab, name) in [(Tab::Resources, "Recursos"), (Tab::Calendar, "Calendário"), (Tab::Speed, "Speed test")] {
         let Some(r) = l.rect(Hit::Tab(tab)) else { continue };
         if tab == view.tab {
@@ -499,6 +498,41 @@ fn lower(p: &Painter, view: &PanelView, l: &Layout) {
         Tab::Resources => resources(p, view, l),
         Tab::Calendar => calendar(p, view, l),
         Tab::Speed => speed(p, view, l),
+    }
+}
+
+/// The audio drop-down over everything: volume bar, then the outputs with a check on the current one.
+fn audio_menu(p: &Painter, view: &PanelView, menu: &AudioMenu, l: &Layout) {
+    let Some(card) = l.menu else { return };
+    // Mostly opaque so it reads over whatever is below.
+    p.color(rgb(0x20242C, 0.85));
+    let radius = p.px(RADIUS);
+    unsafe { p.rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: card, radiusX: radius, radiusY: radius }, p.brush) };
+    p.fill(card, white(0.12));
+    if let Some(track) = l.rect(Hit::Slider(SliderKind::Volume)) {
+        let icon = rect(card.left + p.px(INSET), track.top, track.left - p.px(4.0), track.bottom);
+        let glyph = if view.quick.audio == Toggle::Off { GLYPH_MUTE } else { GLYPH_VOLUME };
+        p.glyph(glyph, &p.f.icon, icon, white(0.92));
+        slider(p, track, menu.volume, view.colors.accent);
+        let value = rect(track.right + p.px(12.0), track.top, card.right - p.px(4.0), track.bottom);
+        p.text(&format!("{}%", menu.volume), &p.f.text, value, Align::Left, white(0.92));
+    }
+    if menu.outputs.is_empty() {
+        let top = card.top + p.px(36.0);
+        p.text("Nenhuma saída de áudio", &p.f.text, rect(card.left + p.px(INSET), top, card.right, top + p.px(ROW_H)), Align::Left, white(0.55));
+    }
+    for (i, name) in menu.outputs.iter().take(MAX_OUTPUTS).enumerate() {
+        let Some(r) = l.rect(Hit::AudioDevice(i)) else { continue };
+        if view.hover == Some(Hit::AudioDevice(i)) {
+            p.fill(r, white(HOVER));
+        }
+        let current = menu.current == Some(i);
+        if current {
+            let check = rect(r.left + p.px(INSET - 2.0), r.top, r.left + p.px(INSET + 18.0), r.bottom);
+            p.glyph(GLYPH_CHECK, &p.f.icon, check, rgb(view.colors.accent, 1.0));
+        }
+        let text = rect(r.left + p.px(INSET + 22.0), r.top, r.right - p.px(INSET), r.bottom);
+        p.text(name, &p.f.text, text, Align::Left, white(if current { 1.0 } else { 0.85 }));
     }
 }
 
@@ -762,7 +796,7 @@ mod tests {
             PanelView { tab: Tab::Speed, speed: SpeedState::Error("Sem conexão".into()), ..full_view(96) },
             PanelView { query: "calc".into(), results, ..full_view(96) },
             PanelView { query: "zzz".into(), ..full_view(96) },
-            PanelView { audio_list: Some(vec!["Fone".into()]), ..full_view(96) },
+            PanelView { audio_menu: Some(AudioMenu { outputs: vec!["Fone".into()], current: Some(0), volume: 40 }), ..full_view(96) },
         ];
         for view in &views {
             let (bmp, drawn) = render(view, &mut cache);

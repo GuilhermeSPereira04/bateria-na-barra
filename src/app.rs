@@ -22,7 +22,8 @@ use crate::media::{self, MediaCmd, NowPlaying};
 use crate::model::{ALL, DeviceKind, ReadOutcome, Tracker};
 use crate::panel::trigger::{CloseRule, EdgeTrigger, Pauses, click_outside_closes, new_press};
 use crate::panel::layout::MAX_ROWS;
-use crate::panel::view::{Hit, Key, PanelView, QuickState, SliderKind, Tab, Toggle};
+use crate::panel::layout::MAX_OUTPUTS;
+use crate::panel::view::{AudioMenu, Hit, Key, PanelView, QuickState, SliderKind, Tab, Toggle};
 use crate::panel::{
     ASYNC_APPS, ASYNC_AUDIO, ASYNC_MEDIA, ASYNC_RADIOS, ASYNC_SPEED, ASYNC_STATS, PanelWindow, WM_PANEL_ASYNC, WM_PANEL_CLOSED, WM_PANEL_DRAG, WM_PANEL_HIT, WM_PANEL_KEY, WM_PANEL_WHEEL,
 };
@@ -139,6 +140,8 @@ struct App {
     /// that read started (the local values are then newer than its own).
     audio_outputs: Vec<(String, String)>,
     audio_list_open: bool,
+    /// Endpoint id of the default output, for the check mark in the list.
+    audio_default: Option<String>,
     audio_rx: Option<Receiver<AudioSnapshot>>,
     audio_touched: bool,
     /// What is playing (last read) and the pending read (panel open only).
@@ -340,6 +343,7 @@ impl App {
         let Some(snap) = self.audio_rx.as_ref().and_then(|rx| rx.try_recv().ok()) else { return };
         self.audio_rx = None;
         self.audio_outputs = snap.outputs.clone();
+        self.audio_default = snap.default_id.clone();
         if !self.audio_touched {
             self.show_audio(snap);
         }
@@ -480,7 +484,11 @@ impl App {
             stats: self.stats.as_ref().map(|s| s.ranked(self.sort_ram, 5)),
             sort_ram: self.sort_ram,
             speed: self.speed.clone(),
-            audio_list: self.audio_list_open.then(|| self.audio_outputs.iter().map(|(_, name)| name.clone()).collect()),
+            audio_menu: self.audio_list_open.then(|| AudioMenu {
+                outputs: self.audio_outputs.iter().take(MAX_OUTPUTS).map(|(_, name)| name.clone()).collect(),
+                current: self.audio_default.as_ref().and_then(|d| self.audio_outputs.iter().take(MAX_OUTPUTS).position(|(id, _)| id == d)),
+                volume: self.quick.volume,
+            }),
             ..Default::default()
         }
     }
@@ -497,6 +505,11 @@ impl App {
 
     /// A click on the panel. The other hits are wired by the tasks that give them data.
     fn on_hit(&mut self, hwnd: HWND, hit: Hit) {
+        // With the audio list open a click elsewhere only closes the list.
+        if self.audio_list_open && !matches!(hit, Hit::AudioDevice(_) | Hit::AudioMore) {
+            self.audio_list_open = false;
+            return self.refresh_panel();
+        }
         match hit {
             Hit::Wifi => return self.toggle_radio(hwnd, RadioKind::Wifi),
             Hit::Bluetooth => return self.toggle_radio(hwnd, RadioKind::Bluetooth),
@@ -506,7 +519,7 @@ impl App {
                 audio::toggle_mute();
                 return self.audio_changed();
             }
-            Hit::AudioMore => {
+            Hit::AudioMore if self.quick.audio != Toggle::Unavailable => {
                 self.audio_list_open = !self.audio_list_open;
                 if self.audio_list_open {
                     self.read_audio(hwnd); // outputs may have come and gone
@@ -554,7 +567,11 @@ impl App {
                     config::save(&self.config);
                 }
             }
-            SliderKind::Volume => {}
+            SliderKind::Volume => {
+                audio::set_volume(value);
+                self.audio_touched = true;
+                self.quick.volume = value.min(100);
+            }
         }
         self.refresh_panel();
     }
@@ -670,7 +687,13 @@ unsafe extern "system" fn owner_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         // Ignore a late request from a panel that is already gone.
         WM_PANEL_CLOSED => with_app(|app| {
             if app.panel.as_ref().is_some_and(|p| p.hwnd().0 as usize == wp.0) {
-                app.close_panel();
+                // lParam 1 = Esc: with the audio list open it closes only the list.
+                if lp.0 == 1 && app.audio_list_open {
+                    app.audio_list_open = false;
+                    app.refresh_panel();
+                } else {
+                    app.close_panel();
+                }
             }
         }),
         WM_PANEL_REMOTE => with_app(|app| {
@@ -827,6 +850,7 @@ pub fn run() -> windows::core::Result<()> {
                 radios_rx: None,
                 audio_outputs: Vec::new(),
                 audio_list_open: false,
+                audio_default: None,
                 audio_rx: None,
                 audio_touched: false,
                 media: None,

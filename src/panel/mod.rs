@@ -391,10 +391,9 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 let _ = unsafe { ReleaseCapture() };
                 return LRESULT(0); // a drag is not a click
             }
-            if let Some(shared) = shared
-                && let Some(hit) = shared.hit_at(lp)
-            {
-                shared.click.set(Some(hit));
+            if let Some(shared) = shared {
+                // A click on nothing still counts: it closes the audio list.
+                shared.click.set(Some(shared.hit_at(lp).unwrap_or(Hit::Blank)));
                 post_owner(hwnd, WM_PANEL_HIT);
             }
             LRESULT(0)
@@ -422,7 +421,10 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             let mut pt = POINT { x: (lp.0 & 0xFFFF) as i16 as i32, y: ((lp.0 >> 16) & 0xFFFF) as i16 as i32 };
             let over_audio = shared.is_some_and(|shared| {
                 unsafe { ScreenToClient(hwnd, &mut pt) }.as_bool()
-                    && matches!(shared.hit_at_point(pt.x as f32, pt.y as f32), Some(Hit::Audio | Hit::AudioMore))
+                    && matches!(
+                        shared.hit_at_point(pt.x as f32, pt.y as f32),
+                        Some(Hit::Audio | Hit::AudioMore | Hit::AudioDevice(_) | Hit::Slider(SliderKind::Volume))
+                    )
             });
             if let Some(shared) = shared.filter(|_| over_audio) {
                 let delta = ((wp.0 >> 16) & 0xFFFF) as i16 as i32;
@@ -435,8 +437,11 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         }
         // If Windows refused us the foreground on open, a click takes it.
         WM_MOUSEACTIVATE => LRESULT(MA_ACTIVATE as isize),
+        // lParam 1 = Esc: the owner closes the audio list first if it is open.
         WM_KEYDOWN if wp.0 == VK_ESCAPE.0 as usize => {
-            post_owner(hwnd, WM_PANEL_CLOSED);
+            if let Some(shared) = shared {
+                let _ = unsafe { PostMessageW(Some(shared.owner), WM_PANEL_CLOSED, WPARAM(hwnd.0 as usize), LPARAM(1)) };
+            }
             LRESULT(0)
         }
         WM_CHAR => {

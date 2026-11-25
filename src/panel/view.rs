@@ -42,7 +42,6 @@ pub enum Key {
 
 /// A bar that is clicked or dragged to set a value (0..=100).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)] // Volume is wired by the audio menu
 pub enum SliderKind {
     Transparency,
     Volume,
@@ -75,7 +74,18 @@ pub enum Hit {
     AccentWindows,
     Tint(usize),
     Slider(SliderKind),
+    /// A click on the panel where nothing is clickable.
+    Blank,
     Result(usize),
+}
+
+/// The drop-down under the audio card: volume bar and output list.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AudioMenu {
+    pub outputs: Vec<String>,
+    /// Index into `outputs` of the default one.
+    pub current: Option<usize>,
+    pub volume: u8,
 }
 
 #[derive(Default)]
@@ -97,7 +107,7 @@ pub struct PanelView {
     pub today: (i32, u32, u32),
     pub speed: crate::speedtest::SpeedState,
     pub gear_open: bool,
-    pub audio_list: Option<Vec<String>>,
+    pub audio_menu: Option<AudioMenu>,
     pub hover: Option<Hit>,
     /// The acrylic backdrop is on: the tint comes from it, not from the drawing.
     pub acrylic: bool,
