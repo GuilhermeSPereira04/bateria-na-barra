@@ -13,12 +13,15 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
 use crate::apps::{self, AppEntry, Catalog};
+use crate::audio::{self, AudioSnapshot};
 use crate::config::{self, Accent, Colors, Config, GlassTint};
 use crate::model::{ALL, DeviceKind, ReadOutcome, Tracker};
 use crate::panel::trigger::{CloseRule, EdgeTrigger, Pauses};
 use crate::panel::layout::MAX_ROWS;
 use crate::panel::view::{Hit, Key, PanelView, QuickState, Tab, Toggle};
-use crate::panel::{ASYNC_APPS, ASYNC_RADIOS, PanelWindow, WM_PANEL_ASYNC, WM_PANEL_CLOSED, WM_PANEL_HIT, WM_PANEL_KEY};
+use crate::panel::{
+    ASYNC_APPS, ASYNC_AUDIO, ASYNC_RADIOS, PanelWindow, WM_PANEL_ASYNC, WM_PANEL_CLOSED, WM_PANEL_HIT, WM_PANEL_KEY, WM_PANEL_WHEEL,
+};
 use crate::readers::{self, WM_READING};
 use crate::radios::{self, RadioKind, RadioSnapshot};
 use crate::render::Strip;
@@ -80,6 +83,8 @@ const TIMER_EDGE: usize = 3; // 100 ms: watch the top edge and the open panel
 // Reserved for the panel: TIMER_STATS = 4, TIMER_MEDIA = 5.
 const TRAY_GLYPH: char = '\u{E83F}';
 const TRAY_ICON_PX: i32 = 32;
+/// Volume change per wheel notch over the audio toggle, in percentage points.
+const VOLUME_STEP: i32 = 2;
 
 struct App {
     tracker: Tracker,
@@ -107,6 +112,13 @@ struct App {
     /// Last known Wi-Fi/Bluetooth state, and the pending read (panel open only).
     quick: QuickState,
     radios_rx: Option<Receiver<RadioSnapshot>>,
+    /// Audio outputs as (id, name), whether their list is open in the body,
+    /// the pending read, and whether the volume or mute changed here since
+    /// that read started (the local values are then newer than its own).
+    audio_outputs: Vec<(String, String)>,
+    audio_list_open: bool,
+    audio_rx: Option<Receiver<AudioSnapshot>>,
+    audio_touched: bool,
 }
 
 thread_local! {
@@ -149,6 +161,7 @@ impl App {
         // Every opening starts on the first tab, with the colors row closed.
         self.tab = Tab::Resources;
         self.gear_open = false;
+        self.audio_list_open = false;
         self.config = config::load();
         self.colors = config::resolve(&self.config);
         self.query.clear();
@@ -159,6 +172,60 @@ impl App {
             self.close = CloseRule::new(); // disarmed until the cursor enters
             self.apps_rx = Some(apps::enumerate_async(hwnd));
             self.radios_rx = Some(radios::spawn(hwnd, || {}));
+            self.read_audio(hwnd);
+        }
+    }
+
+    /// Reads the outputs and the default one's state on a worker thread.
+    fn read_audio(&mut self, hwnd: HWND) {
+        self.audio_touched = false;
+        // Replacing the receiver discards a read still in flight.
+        self.audio_rx = Some(audio::spawn(hwnd));
+    }
+
+    /// The audio state arrived from its worker thread.
+    fn on_audio(&mut self) {
+        let Some(snap) = self.audio_rx.as_ref().and_then(|rx| rx.try_recv().ok()) else { return };
+        self.audio_rx = None;
+        self.audio_outputs = snap.outputs.clone();
+        if !self.audio_touched {
+            self.show_audio(snap);
+        }
+        self.refresh_panel();
+    }
+
+    fn show_audio(&mut self, snap: AudioSnapshot) {
+        self.quick.audio = snap.state;
+        self.quick.volume = snap.volume;
+        self.quick.output_name = snap.output;
+    }
+
+    /// After changing the volume or mute here: read the default output back
+    /// (fast, on this thread) and redraw.
+    fn audio_changed(&mut self) {
+        self.audio_touched = true;
+        self.show_audio(audio::snapshot_from(audio::endpoint(), Vec::new()));
+        self.refresh_panel();
+    }
+
+    /// The wheel turned `notches` over the audio toggle (positive = louder).
+    fn on_wheel(&mut self, notches: i32) {
+        if self.quick.audio == Toggle::Unavailable {
+            return;
+        }
+        audio::step_volume(notches.saturating_mul(VOLUME_STEP));
+        self.audio_changed();
+    }
+
+    /// Output `i` of the list becomes the default; Settings if Windows refuses.
+    fn pick_output(&mut self, hwnd: HWND, i: usize) {
+        let Some(id) = self.audio_outputs.get(i).map(|(id, _)| id.clone()) else { return };
+        if audio::set_default(&id) {
+            self.audio_list_open = false;
+            self.read_audio(hwnd);
+            self.refresh_panel();
+        } else {
+            self.open_settings("ms-settings:sound");
         }
     }
 
@@ -255,6 +322,7 @@ impl App {
             results: self.results.clone(),
             selected: self.selected,
             quick: self.quick.clone(),
+            audio_list: self.audio_list_open.then(|| self.audio_outputs.iter().map(|(_, name)| name.clone()).collect()),
             ..Default::default()
         }
     }
@@ -276,6 +344,18 @@ impl App {
             Hit::Bluetooth => return self.toggle_radio(hwnd, RadioKind::Bluetooth),
             Hit::WifiMore => return self.open_settings("ms-settings:network-wifi"),
             Hit::BtMore => return self.open_settings("ms-settings:bluetooth"),
+            Hit::Audio if self.quick.audio != Toggle::Unavailable => {
+                audio::toggle_mute();
+                return self.audio_changed();
+            }
+            Hit::AudioMore => {
+                self.audio_list_open = !self.audio_list_open;
+                if self.audio_list_open {
+                    self.read_audio(hwnd); // outputs may have come and gone
+                }
+            }
+            Hit::AudioDevice(i) => return self.pick_output(hwnd, i),
+            Hit::AudioSettings => return self.open_settings("ms-settings:sound"),
             Hit::Tab(tab) => self.tab = tab,
             Hit::Gear => self.gear_open = !self.gear_open,
             Hit::Accent(i) if i < config::ACCENTS.len() => self.set_config(Config { accent: Accent::Preset(i), ..self.config }),
@@ -303,6 +383,8 @@ impl App {
         self.catalog = None;
         self.apps_rx = None;
         self.radios_rx = None;
+        self.audio_rx = None;
+        self.audio_list_open = false;
         self.results = Vec::new();
         self.query = String::new();
         // Hand the pages the panel touched back to the system.
@@ -328,8 +410,12 @@ impl App {
         let mut r = RECT::default();
         let _ = unsafe { GetWindowRect(panel.hwnd(), &mut r) };
         let inside = pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom;
-        // Speed test and popups pause it too, once the panel has them.
-        let pauses = Pauses { search_text: !self.query.is_empty(), ..Pauses::default() };
+        // The speed test pauses it too, once the panel has it.
+        let pauses = Pauses {
+            search_text: !self.query.is_empty(),
+            popup_open: self.gear_open || self.audio_list_open,
+            ..Pauses::default()
+        };
         if self.close.update(inside, pauses, now) {
             self.close_panel();
         }
@@ -394,6 +480,13 @@ unsafe extern "system" fn owner_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         }),
         WM_PANEL_ASYNC if wp.0 == ASYNC_APPS => with_app(|app| app.on_apps()),
         WM_PANEL_ASYNC if wp.0 == ASYNC_RADIOS => with_app(|app| app.on_radios()),
+        WM_PANEL_ASYNC if wp.0 == ASYNC_AUDIO => with_app(|app| app.on_audio()),
+        WM_PANEL_WHEEL => with_app(|app| {
+            let notches = app.panel.as_ref().map(|p| p.take_wheel()).unwrap_or(0);
+            if notches != 0 {
+                app.on_wheel(notches);
+            }
+        }),
         WM_STRIP_CLICK => with_app(|app| app.menu(hwnd)),
         WM_TRAY if is_click(lp.0 as u32) => with_app(|app| app.menu(hwnd)),
         WM_SETTINGCHANGE => {
@@ -500,6 +593,10 @@ pub fn run() -> windows::core::Result<()> {
                 apps_rx: None,
                 quick: QuickState::default(),
                 radios_rx: None,
+                audio_outputs: Vec::new(),
+                audio_list_open: false,
+                audio_rx: None,
+                audio_touched: false,
             });
         });
         with_app(|app| app.rebuild());

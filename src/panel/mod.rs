@@ -18,7 +18,7 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint, PAINTSTRUCT,
+    BeginPaint, EndPaint, InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint, PAINTSTRUCT, ScreenToClient,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
@@ -40,6 +40,8 @@ pub const WM_PANEL_ASYNC: u32 = WM_APP + 10;
 pub const ASYNC_APPS: usize = 1;
 /// `WM_PANEL_ASYNC` source: the Wi-Fi and Bluetooth state.
 pub const ASYNC_RADIOS: usize = 2;
+/// `WM_PANEL_ASYNC` source: the audio outputs and the default one's state.
+pub const ASYNC_AUDIO: usize = 5;
 /// Posted to the owner when the panel wants to close itself (Esc, click
 /// outside, lost activation). wParam: the panel's HWND.
 pub const WM_PANEL_CLOSED: u32 = WM_APP + 11;
@@ -49,6 +51,15 @@ pub const WM_PANEL_HIT: u32 = WM_APP + 12;
 /// Posted to the owner after keys were typed; the owner collects them with
 /// `PanelWindow::take_keys`. wParam: the panel's HWND.
 pub const WM_PANEL_KEY: u32 = WM_APP + 13;
+/// Posted to the owner after the wheel turned over the audio toggle; the
+/// owner collects the notches with `PanelWindow::take_wheel`. wParam: the panel's HWND.
+pub const WM_PANEL_WHEEL: u32 = WM_APP + 14;
+
+/// Whole wheel notches in an accumulated `WM_MOUSEWHEEL` delta, and the rest
+/// (fine-grained wheels and touchpads send fractions of a notch).
+fn wheel_notches(delta: i32) -> (i32, i32) {
+    (delta / WHEEL_DELTA as i32, delta % WHEEL_DELTA as i32)
+}
 
 /// The search key behind a `WM_CHAR` (printable characters only; Backspace,
 /// Enter and Esc come through `WM_KEYDOWN`).
@@ -109,6 +120,8 @@ struct Shared {
     click: Cell<Option<Hit>>,
     /// Keys typed since the owner last looked (see `WM_PANEL_KEY`).
     keys: RefCell<Vec<Key>>,
+    /// Wheel delta over the audio toggle not yet taken by the owner.
+    wheel: Cell<i32>,
     /// `TrackMouseEvent` is armed (a `WM_MOUSELEAVE` will come).
     tracking: Cell<bool>,
 }
@@ -186,7 +199,10 @@ impl Shared {
 
     fn hit_at(&self, lp: LPARAM) -> Option<Hit> {
         // Signed client coordinates.
-        let (x, y) = ((lp.0 & 0xFFFF) as i16 as f32, ((lp.0 >> 16) & 0xFFFF) as i16 as f32);
+        self.hit_at_point((lp.0 & 0xFFFF) as i16 as f32, ((lp.0 >> 16) & 0xFFFF) as i16 as f32)
+    }
+
+    fn hit_at_point(&self, x: f32, y: f32) -> Option<Hit> {
         self.scene.try_borrow().ok().and_then(|scene| hit_test(&scene.layout, x, y))
     }
 }
@@ -302,6 +318,8 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 let more = match shared.hit_at(lp) {
                     Some(Hit::Wifi) => Some(Hit::WifiMore),
                     Some(Hit::Bluetooth) => Some(Hit::BtMore),
+                    // The audio arrow opens the output list; the settings page is right-click only.
+                    Some(Hit::Audio | Hit::AudioMore) => Some(Hit::AudioSettings),
                     _ => None,
                 };
                 if let Some(hit) = more {
@@ -310,6 +328,23 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 }
             }
             LRESULT(0)
+        }
+        // The wheel over the audio toggle sets the volume (handled by the owner).
+        // Unlike clicks, WM_MOUSEWHEEL carries screen coordinates.
+        WM_MOUSEWHEEL => {
+            let mut pt = POINT { x: (lp.0 & 0xFFFF) as i16 as i32, y: ((lp.0 >> 16) & 0xFFFF) as i16 as i32 };
+            let over_audio = shared.is_some_and(|shared| {
+                unsafe { ScreenToClient(hwnd, &mut pt) }.as_bool()
+                    && matches!(shared.hit_at_point(pt.x as f32, pt.y as f32), Some(Hit::Audio | Hit::AudioMore))
+            });
+            if let Some(shared) = shared.filter(|_| over_audio) {
+                let delta = ((wp.0 >> 16) & 0xFFFF) as i16 as i32;
+                shared.wheel.set(shared.wheel.get().saturating_add(delta));
+                post_owner(hwnd, WM_PANEL_WHEEL);
+                LRESULT(0)
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+            }
         }
         // If Windows refused us the foreground on open, a click takes it.
         WM_MOUSEACTIVATE => LRESULT(MA_ACTIVATE as isize),
@@ -397,6 +432,7 @@ impl PanelWindow {
                 scene: RefCell::new(Scene { view, layout }),
                 click: Cell::new(None),
                 keys: RefCell::new(Vec::new()),
+                wheel: Cell::new(0),
                 tracking: Cell::new(false),
             });
             // No WS_EX_LAYERED: it would block the system backdrop.
@@ -458,6 +494,14 @@ impl PanelWindow {
         self.shared.click.take()
     }
 
+    /// Whole wheel notches turned over the audio toggle since the last call
+    /// (positive = away from the user); the remainder waits for more.
+    pub fn take_wheel(&self) -> i32 {
+        let (notches, rest) = wheel_notches(self.shared.wheel.get());
+        self.shared.wheel.set(rest);
+        notches
+    }
+
     /// The keys announced by the last `WM_PANEL_KEY`, in typing order.
     pub fn take_keys(&self) -> Vec<Key> {
         self.shared.keys.try_borrow_mut().map(|mut k| std::mem::take(&mut *k)).unwrap_or_default()
@@ -516,6 +560,15 @@ mod tests {
         assert_eq!(vk_key(VK_UP.0 as usize), Some(Key::Up));
         assert_eq!(vk_key(VK_DOWN.0 as usize), Some(Key::Down));
         assert_eq!(vk_key(VK_ESCAPE.0 as usize), None); // closes, handled apart
+    }
+
+    #[test]
+    fn wheel_counts_whole_notches() {
+        assert_eq!(wheel_notches(120), (1, 0));
+        assert_eq!(wheel_notches(-240), (-2, 0));
+        assert_eq!(wheel_notches(60), (0, 60)); // a fine-grained touchpad: wait for more
+        assert_eq!(wheel_notches(180), (1, 60));
+        assert_eq!(wheel_notches(-60), (0, -60));
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 mod app;
 mod apps;
+mod audio;
 mod config;
 mod media;
 mod model;

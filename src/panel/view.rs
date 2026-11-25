@@ -52,6 +52,8 @@ pub enum Hit {
     Audio,
     AudioMore,
     AudioDevice(usize),
+    /// Right-click on the audio toggle (no region of its own).
+    AudioSettings,
     MediaPrev,
     MediaPlay,
     MediaNext,
