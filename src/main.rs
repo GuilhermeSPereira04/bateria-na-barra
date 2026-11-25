@@ -2,6 +2,7 @@
 
 mod app;
 mod model;
+mod panel;
 mod readers;
 mod render;
 mod startup;
