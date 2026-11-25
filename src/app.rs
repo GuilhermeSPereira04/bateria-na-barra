@@ -40,6 +40,9 @@ const TIMER_SYNC: usize = 1; // 1 s: keep the strip placed and on top
 /// resize) or the foreground window changes (fullscreen check).
 const WM_TASKBAR_MOVED: u32 = WM_APP + 5;
 
+/// Posted by a second launch with `--painel`: wParam 1 opens, 0 closes.
+pub const WM_PANEL_REMOTE: u32 = WM_APP + 20;
+
 static OWNER: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static TASKBAR: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
@@ -647,6 +650,13 @@ unsafe extern "system" fn owner_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         // Ignore a late request from a panel that is already gone.
         WM_PANEL_CLOSED => with_app(|app| {
             if app.panel.as_ref().is_some_and(|p| p.hwnd().0 as usize == wp.0) {
+                app.close_panel();
+            }
+        }),
+        WM_PANEL_REMOTE => with_app(|app| {
+            if wp.0 != 0 {
+                app.open_panel(hwnd);
+            } else {
                 app.close_panel();
             }
         }),

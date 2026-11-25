@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 /// How long the cursor must rest on the top edge to open the panel.
-pub const HOLD_TO_OPEN: Duration = Duration::from_millis(1500);
+pub const HOLD_TO_OPEN: Duration = Duration::from_millis(500);
 /// How long the cursor must stay outside the panel before it closes.
 pub const LEAVE_GRACE: Duration = Duration::from_millis(500);
 
@@ -116,8 +116,8 @@ mod tests {
         let t0 = Instant::now();
         let mut e = EdgeTrigger::new();
         assert!(!e.update(true, false, t0));
-        assert!(!e.update(true, false, t0 + ms(1499)));
-        assert!(e.update(true, false, t0 + ms(1500)));
+        assert!(!e.update(true, false, t0 + ms(499)));
+        assert!(e.update(true, false, t0 + ms(500)));
     }
 
     #[test]
@@ -125,11 +125,11 @@ mod tests {
         let t0 = Instant::now();
         let mut e = EdgeTrigger::new();
         e.update(true, false, t0);
-        assert!(e.update(true, false, t0 + ms(1500)));
+        assert!(e.update(true, false, t0 + ms(500)));
         assert!(!e.update(true, false, t0 + ms(3000)));
         assert!(!e.update(false, false, t0 + ms(3100)));
         assert!(!e.update(true, false, t0 + ms(3200)));
-        assert!(e.update(true, false, t0 + ms(4700)));
+        assert!(e.update(true, false, t0 + ms(3700)));
     }
 
     #[test]
@@ -139,8 +139,8 @@ mod tests {
         e.update(true, false, t0);
         e.update(false, false, t0 + ms(1000));
         e.update(true, false, t0 + ms(1100));
-        assert!(!e.update(true, false, t0 + ms(2000)));
-        assert!(e.update(true, false, t0 + ms(2600)));
+        assert!(!e.update(true, false, t0 + ms(1500)));
+        assert!(e.update(true, false, t0 + ms(1600)));
     }
 
     #[test]
@@ -151,7 +151,7 @@ mod tests {
             assert!(!e.update(true, true, t0 + Duration::from_secs(s)));
         }
         assert!(!e.update(true, false, t0 + ms(5000)));
-        assert!(e.update(true, false, t0 + ms(6500)));
+        assert!(e.update(true, false, t0 + ms(5500)));
     }
 
     #[test]
@@ -167,7 +167,7 @@ mod tests {
         // Leaving the edge re-arms it.
         assert!(!e.update(false, false, t0 + ms(5100)));
         assert!(!e.update(true, false, t0 + ms(5200)));
-        assert!(e.update(true, false, t0 + ms(6700)));
+        assert!(e.update(true, false, t0 + ms(5700)));
     }
 
     #[test]

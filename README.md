@@ -21,7 +21,8 @@ Mostra na barra de tarefas do Windows 11, à esquerda da bandeja, a bateria de:
 
 Um painel de vidro que desce do topo da tela, no monitor principal.
 
-- **Abrir:** deixe o mouse na borda de cima da tela por 1,5 s, ou use **Abrir painel** no menu da bandeja.
+- **Abrir:** deixe o mouse na borda de cima da tela por 0,5 s, ou use **Abrir painel** no menu da bandeja.
+  `battery-bar.exe --painel abrir` abre o painel na inst�ncia que est� rodando (�til pra atalho); `--painel fechar` fecha.
   Fecha com `Esc`, clicando fora ou quando perde o foco, e sozinho ~0,5 s depois que o mouse sai dele
   (isso fica pausado enquanto há texto na busca, durante o speed test ou com o ⚙ ou a lista de áudio aberta).
 - **Busca de apps:** é só digitar com o painel aberto; `Enter` abre o resultado.
