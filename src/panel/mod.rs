@@ -24,23 +24,47 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
-use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY, VK_BACK, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_UP,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
 
 use layout::{Layout, hit_test};
-use view::{Hit, PanelView};
+use view::{Hit, Key, PanelView};
 
 /// Posted to the owner by panel worker threads when new data is ready
-/// (wParam: which source, see the panel tasks).
-#[allow(dead_code)] // posted by the panel's worker threads (later tasks)
+/// (wParam: which source, see `ASYNC_*`).
 pub const WM_PANEL_ASYNC: u32 = WM_APP + 10;
+/// `WM_PANEL_ASYNC` source: the app list for the search.
+pub const ASYNC_APPS: usize = 1;
 /// Posted to the owner when the panel wants to close itself (Esc, click
 /// outside, lost activation). wParam: the panel's HWND.
 pub const WM_PANEL_CLOSED: u32 = WM_APP + 11;
 /// Posted to the owner after a click on something clickable; the owner
 /// collects it with `PanelWindow::take_click`. wParam: the panel's HWND.
 pub const WM_PANEL_HIT: u32 = WM_APP + 12;
+/// Posted to the owner after keys were typed; the owner collects them with
+/// `PanelWindow::take_keys`. wParam: the panel's HWND.
+pub const WM_PANEL_KEY: u32 = WM_APP + 13;
+
+/// The search key behind a `WM_CHAR` (printable characters only; Backspace,
+/// Enter and Esc come through `WM_KEYDOWN`).
+fn char_key(unit: usize) -> Option<Key> {
+    let c = char::from_u32(unit as u32)?;
+    (!c.is_control()).then_some(Key::Char(c))
+}
+
+/// The search key behind a `WM_KEYDOWN`.
+fn vk_key(vk: usize) -> Option<Key> {
+    match VIRTUAL_KEY(vk as u16) {
+        VK_BACK => Some(Key::Backspace),
+        VK_UP => Some(Key::Up),
+        VK_DOWN => Some(Key::Down),
+        VK_RETURN => Some(Key::Enter),
+        _ => None,
+    }
+}
 
 /// True when `pt` is on the top row of `monitor` (not on a monitor stacked above it).
 pub fn on_top_edge(pt: POINT, monitor: RECT) -> bool {
@@ -81,6 +105,8 @@ struct Shared {
     scene: RefCell<Scene>,
     /// The last click, waiting for the owner (see `WM_PANEL_HIT`).
     click: Cell<Option<Hit>>,
+    /// Keys typed since the owner last looked (see `WM_PANEL_KEY`).
+    keys: RefCell<Vec<Key>>,
     /// `TrackMouseEvent` is armed (a `WM_MOUSELEAVE` will come).
     tracking: Cell<bool>,
 }
@@ -192,6 +218,17 @@ fn shared_of(hwnd: HWND) -> Option<&'static Shared> {
     unsafe { ptr.as_ref() }
 }
 
+/// Queues `key` for the owner (outside this window procedure: Enter may close the panel).
+fn type_key(hwnd: HWND, shared: Option<&Shared>, key: Option<Key>) {
+    if let (Some(shared), Some(key)) = (shared, key)
+        && let Ok(mut keys) = shared.keys.try_borrow_mut()
+    {
+        keys.push(key);
+        // The owner drains the whole queue; a later message finds it empty.
+        post_owner(hwnd, WM_PANEL_KEY);
+    }
+}
+
 fn post_owner(hwnd: HWND, msg: u32) {
     if let Some(shared) = shared_of(hwnd) {
         let _ = unsafe { PostMessageW(Some(shared.owner), msg, WPARAM(hwnd.0 as usize), LPARAM(0)) };
@@ -261,6 +298,14 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         WM_MOUSEACTIVATE => LRESULT(MA_ACTIVATE as isize),
         WM_KEYDOWN if wp.0 == VK_ESCAPE.0 as usize => {
             post_owner(hwnd, WM_PANEL_CLOSED);
+            LRESULT(0)
+        }
+        WM_CHAR => {
+            type_key(hwnd, shared, char_key(wp.0));
+            LRESULT(0)
+        }
+        WM_KEYDOWN if vk_key(wp.0).is_some() => {
+            type_key(hwnd, shared, vk_key(wp.0));
             LRESULT(0)
         }
         WM_ACTIVATE if (wp.0 & 0xFFFF) as u32 == WA_INACTIVE => {
@@ -334,6 +379,7 @@ impl PanelWindow {
                 }),
                 scene: RefCell::new(Scene { view, layout }),
                 click: Cell::new(None),
+                keys: RefCell::new(Vec::new()),
                 tracking: Cell::new(false),
             });
             // No WS_EX_LAYERED: it would block the system backdrop.
@@ -388,6 +434,11 @@ impl PanelWindow {
     pub fn take_click(&self) -> Option<Hit> {
         self.shared.click.take()
     }
+
+    /// The keys announced by the last `WM_PANEL_KEY`, in typing order.
+    pub fn take_keys(&self) -> Vec<Key> {
+        self.shared.keys.try_borrow_mut().map(|mut k| std::mem::take(&mut *k)).unwrap_or_default()
+    }
 }
 
 impl Drop for PanelWindow {
@@ -426,6 +477,22 @@ mod tests {
         assert!(!on_top_edge(POINT { x: 960, y: -500 }, MONITOR)); // monitor stacked above
         assert!(!on_top_edge(POINT { x: 1920, y: 0 }, MONITOR)); // right of the primary
         assert!(!on_top_edge(POINT { x: -1, y: 0 }, MONITOR));
+    }
+
+    #[test]
+    fn typed_keys() {
+        assert_eq!(char_key('a' as usize), Some(Key::Char('a')));
+        assert_eq!(char_key('ã' as usize), Some(Key::Char('ã')));
+        assert_eq!(char_key(' ' as usize), Some(Key::Char(' ')));
+        // Control characters (Backspace, Enter, Esc, Ctrl+Backspace) and lone surrogates.
+        for unit in [0x08, 0x0D, 0x1B, 0x7F, 0xD83D] {
+            assert_eq!(char_key(unit), None, "{unit:#x}");
+        }
+        assert_eq!(vk_key(VK_BACK.0 as usize), Some(Key::Backspace));
+        assert_eq!(vk_key(VK_RETURN.0 as usize), Some(Key::Enter));
+        assert_eq!(vk_key(VK_UP.0 as usize), Some(Key::Up));
+        assert_eq!(vk_key(VK_DOWN.0 as usize), Some(Key::Down));
+        assert_eq!(vk_key(VK_ESCAPE.0 as usize), None); // closes, handled apart
     }
 
     #[test]

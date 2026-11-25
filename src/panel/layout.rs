@@ -201,7 +201,7 @@ mod tests {
     }
 
     fn results(n: usize) -> Vec<AppEntry> {
-        (0..n).map(|i| AppEntry { name: format!("App {i}"), id: format!("id{i}") }).collect()
+        (0..n).map(|i| AppEntry { name: format!("App {i}"), id: format!("id{i}"), icon: None }).collect()
     }
 
     #[test]

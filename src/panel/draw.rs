@@ -2,11 +2,13 @@
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::core::PCWSTR;
 use windows_numerics::Vector2;
 
 use super::layout::{INSET, Layout, MAX_ROWS, ROW_H, scale};
 use super::view::{Hit, PanelView, Tab, Toggle};
+use crate::apps::{AppEntry, Icon};
 use crate::config::{ACCENTS, Accent, Colors, GlassTint};
 use crate::model::ItemView;
 use crate::render::{BOLT, ICON_FONT, TEXT_FONT, device_glyph, item_style, rgb};
@@ -16,6 +18,8 @@ const CARD: f32 = 0.07; // white over the dark glass
 const HOVER: f32 = 0.06;
 const SELECTED: f32 = 0.10;
 const RADIUS: f32 = 8.0;
+/// Result icons, in DIP.
+const ICON: f32 = 20.0;
 const TEXT: u32 = 0xFFFFFF;
 const ERROR: u32 = 0xFF6B5E;
 /// Text over an accent fill (accents are light colors).
@@ -38,11 +42,14 @@ const GLYPH_RIGHT: char = '\u{E76C}';
 const MONTHS: [&str; 12] =
     ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"];
 
-/// Text formats (per DPI) and the brush (per render target), kept between paints.
+/// Text formats (per DPI), the brush and the result icons (per render
+/// target), kept between paints.
 pub struct Cache {
     dpi: u32,
     fonts: Option<Fonts>,
     brush: Option<ID2D1SolidColorBrush>,
+    /// Bitmaps of the results' icons, by app id.
+    icons: Vec<(String, ID2D1Bitmap)>,
 }
 
 struct Fonts {
@@ -56,13 +63,39 @@ struct Fonts {
 
 impl Cache {
     pub fn new() -> Self {
-        Self { dpi: 0, fonts: None, brush: None }
+        Self { dpi: 0, fonts: None, brush: None, icons: Vec::new() }
     }
 
     /// Forgets what belongs to a render target that is being replaced.
     pub fn reset_target(&mut self) {
         self.brush = None;
+        self.icons.clear();
     }
+
+    /// Keeps bitmaps for exactly the visible results that have an icon.
+    fn sync_icons(&mut self, rt: &ID2D1RenderTarget, results: &[AppEntry]) {
+        let visible = &results[..results.len().min(MAX_ROWS)];
+        self.icons.retain(|(id, _)| visible.iter().any(|a| &a.id == id && a.icon.is_some()));
+        for app in visible {
+            let Some(icon) = &app.icon else { continue };
+            if self.icons.iter().any(|(id, _)| id == &app.id) {
+                continue;
+            }
+            if let Ok(bmp) = bitmap(rt, icon) {
+                self.icons.push((app.id.clone(), bmp));
+            }
+        }
+    }
+}
+
+fn bitmap(rt: &ID2D1RenderTarget, icon: &Icon) -> windows::core::Result<ID2D1Bitmap> {
+    let props = D2D1_BITMAP_PROPERTIES {
+        pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+        dpiX: 96.0,
+        dpiY: 96.0,
+    };
+    let size = D2D_SIZE_U { width: icon.size, height: icon.size };
+    unsafe { rt.CreateBitmap(size, Some(icon.bgra.as_ptr() as _), icon.size * 4, &props) }
 }
 
 fn format(dw: &IDWriteFactory, family: PCWSTR, weight: DWRITE_FONT_WEIGHT, size: f32) -> windows::core::Result<IDWriteTextFormat> {
@@ -105,6 +138,7 @@ struct Painter<'a> {
     brush: &'a ID2D1SolidColorBrush,
     f: &'a Fonts,
     s: f32,
+    icons: &'a [(String, ID2D1Bitmap)],
 }
 
 fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
@@ -185,8 +219,10 @@ pub fn draw(rt: &ID2D1RenderTarget, dw: &IDWriteFactory, cache: &mut Cache, view
     if cache.brush.is_none() {
         cache.brush = Some(unsafe { rt.CreateSolidColorBrush(&white(1.0), None)? });
     }
+    let shown: &[AppEntry] = if view.query.is_empty() { &[] } else { &view.results };
+    cache.sync_icons(rt, shown);
     let (Some(f), Some(brush)) = (&cache.fonts, &cache.brush) else { return Ok(()) };
-    let p = Painter { rt, dw, brush, f, s };
+    let p = Painter { rt, dw, brush, f, s, icons: &cache.icons };
     // ClearType can't blend onto transparent pixels.
     unsafe { rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE) };
 
@@ -373,13 +409,17 @@ fn media(p: &Painter, view: &PanelView, l: &Layout) {
 fn lower(p: &Painter, view: &PanelView, l: &Layout) {
     p.fill(l.body, white(CARD));
     if !view.query.is_empty() {
-        let names: Vec<&str> = view.results.iter().map(|a| a.name.as_str()).collect();
-        rows(p, l, &names, Hit::Result, Some(view.selected), "Nada encontrado");
+        let items: Vec<(&str, Option<&ID2D1Bitmap>)> = view
+            .results
+            .iter()
+            .map(|a| (a.name.as_str(), p.icons.iter().find(|(id, _)| id == &a.id).map(|(_, b)| b)))
+            .collect();
+        rows(p, l, &items, Hit::Result, Some(view.selected), "Nada encontrado");
         return;
     }
     if let Some(outputs) = &view.audio_list {
-        let names: Vec<&str> = outputs.iter().map(String::as_str).collect();
-        rows(p, l, &names, Hit::AudioDevice, None, "Nenhuma saída de áudio");
+        let items: Vec<(&str, Option<&ID2D1Bitmap>)> = outputs.iter().map(|o| (o.as_str(), None)).collect();
+        rows(p, l, &items, Hit::AudioDevice, None, "Nenhuma saída de áudio");
         return;
     }
     for (tab, name) in [(Tab::Resources, "Recursos"), (Tab::Calendar, "Calendário"), (Tab::Speed, "Speed test")] {
@@ -401,20 +441,28 @@ fn lower(p: &Painter, view: &PanelView, l: &Layout) {
     }
 }
 
-/// One line per item (results or audio outputs), at most `MAX_ROWS`.
-fn rows(p: &Painter, l: &Layout, names: &[&str], hit: fn(usize) -> Hit, selected: Option<usize>, empty: &str) {
-    if names.is_empty() {
+/// One line per item (results or audio outputs, with an optional icon), at most `MAX_ROWS`.
+fn rows(p: &Painter, l: &Layout, items: &[(&str, Option<&ID2D1Bitmap>)], hit: fn(usize) -> Hit, selected: Option<usize>, empty: &str) {
+    if items.is_empty() {
         let b = l.body;
         let r = rect(b.left + p.px(INSET), b.top, b.right, b.top + p.px(ROW_H));
         p.text(empty, &p.f.text, r, Align::Left, white(0.55));
         return;
     }
-    for (i, name) in names.iter().take(MAX_ROWS).enumerate() {
+    for (i, (name, icon)) in items.iter().take(MAX_ROWS).enumerate() {
         let Some(r) = l.rect(hit(i)) else { continue };
         if selected == Some(i) {
             p.fill(r, white(SELECTED));
         }
-        let text = rect(r.left + p.px(INSET), r.top, r.right - p.px(INSET), r.bottom);
+        let mut left = r.left + p.px(INSET);
+        if let Some(bmp) = icon {
+            let size = p.px(ICON);
+            let top = (r.top + r.bottom - size) / 2.0;
+            let dest = rect(left, top, left + size, top + size);
+            unsafe { p.rt.DrawBitmap(*bmp, Some(&dest), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None) };
+            left += size + p.px(10.0);
+        }
+        let text = rect(left, r.top, r.right - p.px(INSET), r.bottom);
         p.text(name, &p.f.text, text, Align::Left, white(0.92));
     }
 }
@@ -553,13 +601,11 @@ fn speed(p: &Painter, view: &PanelView, l: &Layout) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::apps::AppEntry;
     use crate::media::NowPlaying;
     use crate::model::{Charge, DeviceKind, Reading};
     use crate::panel::layout::layout;
     use crate::render::Bitmap;
     use crate::sysinfo::{ProcRow, Stats};
-    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 
     /// Draws `view` into a software target; returns the BGRA pixels.
     fn render(view: &PanelView, cache: &mut Cache) -> (Bitmap, windows::core::Result<()>) {
@@ -614,7 +660,7 @@ mod tests {
     #[test]
     fn draws_every_mode() {
         let mut cache = Cache::new();
-        let results = vec![AppEntry { name: "Calculadora".into(), id: "calc".into() }];
+        let results = vec![AppEntry { name: "Calculadora".into(), id: "calc".into(), icon: None }];
         let views = [
             PanelView::default(),
             full_view(96),
@@ -635,6 +681,21 @@ mod tests {
             assert!(alpha(2, 2) > 0, "tint");
             assert!(alpha((100.0 * s) as i32, (20.0 * s) as i32) > alpha(2, 2), "search card");
         }
+    }
+
+    #[test]
+    fn result_icon_is_drawn() {
+        // An opaque white 32 px icon lands left in the first row.
+        let icon = std::sync::Arc::new(Icon { size: 32, bgra: vec![255; 32 * 32 * 4] });
+        let results = vec![AppEntry { name: "Calculadora".into(), id: "calc".into(), icon: Some(icon) }];
+        let view = PanelView { query: "calc".into(), results, ..full_view(96) };
+        let row = layout(&view).rect(Hit::Result(0)).unwrap();
+        let (x, y) = ((row.left + INSET + ICON / 2.0) as i32, ((row.top + row.bottom) / 2.0) as i32);
+        let mut cache = Cache::new();
+        let (bmp, drawn) = render(&view, &mut cache);
+        drawn.unwrap();
+        let px = &bmp.pixels()[((y * bmp.width + x) * 4) as usize..][..4];
+        assert_eq!(px, [255, 255, 255, 255]);
     }
 
     #[test]

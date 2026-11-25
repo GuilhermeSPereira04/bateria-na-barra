@@ -30,6 +30,16 @@ pub struct QuickState {
     pub output_name: Option<String>,
 }
 
+/// A key typed in the panel (for the search).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Key {
+    Char(char),
+    Backspace,
+    Up,
+    Down,
+    Enter,
+}
+
 /// A clickable area of the panel.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Hit {

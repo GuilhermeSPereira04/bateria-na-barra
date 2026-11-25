@@ -12,11 +12,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, 
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
+use crate::apps::{self, AppEntry, Catalog};
 use crate::config::{self, Accent, Colors, Config, GlassTint};
 use crate::model::{ALL, DeviceKind, ReadOutcome, Tracker};
 use crate::panel::trigger::{CloseRule, EdgeTrigger, Pauses};
-use crate::panel::view::{Hit, PanelView, Tab};
-use crate::panel::{PanelWindow, WM_PANEL_CLOSED, WM_PANEL_HIT};
+use crate::panel::layout::MAX_ROWS;
+use crate::panel::view::{Hit, Key, PanelView, Tab};
+use crate::panel::{ASYNC_APPS, PanelWindow, WM_PANEL_ASYNC, WM_PANEL_CLOSED, WM_PANEL_HIT, WM_PANEL_KEY};
 use crate::readers::{self, WM_READING};
 use crate::render::Strip;
 use crate::taskbar::{StripWindow, WM_STRIP_CLICK};
@@ -94,6 +96,13 @@ struct App {
     gear_open: bool,
     config: Config,
     colors: Colors,
+    /// Search text, its matches and the highlighted one (panel open only).
+    query: String,
+    results: Vec<AppEntry>,
+    selected: usize,
+    /// The app list while the panel is open, and its pending enumeration.
+    catalog: Option<Catalog>,
+    apps_rx: Option<Receiver<Vec<AppEntry>>>,
 }
 
 thread_local! {
@@ -138,10 +147,61 @@ impl App {
         self.gear_open = false;
         self.config = config::load();
         self.colors = config::resolve(&self.config);
+        self.query.clear();
+        self.results.clear();
+        self.selected = 0;
         if let Ok(panel) = PanelWindow::open(hwnd, self.panel_view()) {
             self.panel = Some(panel);
             self.close = CloseRule::new(); // disarmed until the cursor enters
+            self.apps_rx = Some(apps::enumerate_async(hwnd));
         }
+    }
+
+    /// The app list arrived from the enumeration thread.
+    fn on_apps(&mut self) {
+        let Some(list) = self.apps_rx.as_ref().and_then(|rx| rx.try_recv().ok()) else { return };
+        self.apps_rx = None;
+        self.catalog = Some(Catalog::new(list));
+        self.search();
+        self.refresh_panel();
+    }
+
+    /// Recomputes the results for the current query, highlighting the first.
+    fn search(&mut self) {
+        self.selected = 0;
+        self.results = match &mut self.catalog {
+            Some(catalog) if !self.query.is_empty() => catalog.search(&self.query, MAX_ROWS),
+            _ => Vec::new(),
+        };
+    }
+
+    /// A key typed in the panel (the caller redraws).
+    fn on_key(&mut self, key: Key) {
+        match key {
+            // A leading space would only hide the tabs.
+            Key::Char(c) if c.is_whitespace() && self.query.is_empty() => {}
+            Key::Char(c) => {
+                self.query.push(c);
+                self.search();
+            }
+            Key::Backspace => {
+                self.query.pop();
+                self.search();
+            }
+            Key::Up => self.selected = self.selected.saturating_sub(1),
+            Key::Down => self.selected = (self.selected + 1).min(self.results.len().saturating_sub(1)),
+            Key::Enter => self.launch(self.selected),
+        }
+    }
+
+    /// Opens result `i` and closes the panel.
+    fn launch(&mut self, i: usize) {
+        if self.query.is_empty() {
+            return;
+        }
+        let Some(id) = self.results.get(i).map(|a| a.id.clone()) else { return };
+        apps::launch(&id);
+        self.close_panel();
     }
 
     /// Everything the panel shows, from the current state.
@@ -152,6 +212,9 @@ impl App {
             tab: self.tab,
             gear_open: self.gear_open,
             colors: self.colors,
+            query: self.query.clone(),
+            results: self.results.clone(),
+            selected: self.selected,
             ..Default::default()
         }
     }
@@ -174,6 +237,7 @@ impl App {
             Hit::Accent(i) if i < config::ACCENTS.len() => self.set_config(Config { accent: Accent::Preset(i), ..self.config }),
             Hit::AccentWindows => self.set_config(Config { accent: Accent::Windows, ..self.config }),
             Hit::Tint(i) if i < GlassTint::ALL.len() => self.set_config(Config { tint: GlassTint::ALL[i], ..self.config }),
+            Hit::Result(i) => return self.launch(i),
             _ => return,
         }
         self.refresh_panel();
@@ -191,6 +255,11 @@ impl App {
             return;
         }
         self.panel = None;
+        // The app list and its icons only live while the panel is open.
+        self.catalog = None;
+        self.apps_rx = None;
+        self.results = Vec::new();
+        self.query = String::new();
         // Hand the pages the panel touched back to the system.
         unsafe {
             let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
@@ -214,8 +283,9 @@ impl App {
         let mut r = RECT::default();
         let _ = unsafe { GetWindowRect(panel.hwnd(), &mut r) };
         let inside = pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom;
-        // Pauses come from the panel's state (search text, speed test, popups) once it has one.
-        if self.close.update(inside, Pauses::default(), now) {
+        // Speed test and popups pause it too, once the panel has them.
+        let pauses = Pauses { search_text: !self.query.is_empty(), ..Pauses::default() };
+        if self.close.update(inside, pauses, now) {
             self.close_panel();
         }
     }
@@ -264,6 +334,20 @@ unsafe extern "system" fn owner_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 app.on_hit(hit);
             }
         }),
+        WM_PANEL_KEY => with_app(|app| {
+            let keys = app.panel.as_ref().map(|p| p.take_keys()).unwrap_or_default();
+            if keys.is_empty() {
+                return;
+            }
+            for key in keys {
+                app.on_key(key);
+                if app.panel.is_none() {
+                    return; // Enter opened an app
+                }
+            }
+            app.refresh_panel();
+        }),
+        WM_PANEL_ASYNC if wp.0 == ASYNC_APPS => with_app(|app| app.on_apps()),
         WM_STRIP_CLICK => with_app(|app| app.menu(hwnd)),
         WM_TRAY if is_click(lp.0 as u32) => with_app(|app| app.menu(hwnd)),
         WM_SETTINGCHANGE => {
@@ -363,6 +447,11 @@ pub fn run() -> windows::core::Result<()> {
                 gear_open: false,
                 config: Config::default(),
                 colors: Colors::default(),
+                query: String::new(),
+                results: Vec::new(),
+                selected: 0,
+                catalog: None,
+                apps_rx: None,
             });
         });
         with_app(|app| app.rebuild());

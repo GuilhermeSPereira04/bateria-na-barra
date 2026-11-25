@@ -8,6 +8,7 @@ mod model;
 mod panel;
 mod readers;
 mod render;
+mod search;
 mod speedtest;
 mod startup;
 mod sysinfo;
