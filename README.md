@@ -22,16 +22,19 @@ Mostra na barra de tarefas do Windows 11, à esquerda da bandeja, a bateria de:
 Um painel de vidro que desce do topo da tela, no monitor principal.
 
 - **Abrir:** deixe o mouse na borda de cima da tela por 0,5 s, ou use **Abrir painel** no menu da bandeja.
-  `battery-bar.exe --painel abrir` abre o painel na inst�ncia que est� rodando (�til pra atalho); `--painel fechar` fecha.
+  `battery-bar.exe --painel abrir` abre o painel na instância que está rodando (útil pra atalho); `--painel fechar` fecha.
   Fecha com `Esc`, clicando fora ou quando perde o foco, e sozinho ~0,5 s depois que o mouse sai dele
   (isso fica pausado enquanto há texto na busca, durante o speed test ou com o ⚙ ou a lista de áudio aberta).
 - **Busca de apps:** é só digitar com o painel aberto; `Enter` abre o resultado.
 - **Atalhos rápidos:** Wi-Fi, Bluetooth e áudio. Clique liga/desliga (no áudio, muta); clique com o botão
   direito abre a página correspondente das Configurações do Windows. No Wi-Fi e no Bluetooth a seta faz o
-  mesmo; no áudio a seta abre a lista de saídas, e a roda do mouse sobre ele muda o volume.
+  mesmo; no áudio a seta abre uma lista suspensa logo abaixo do cartão: uma barra de volume (clique ou arraste)
+  e as saídas de áudio, com ✓ na atual; clicar numa saída troca o som pra ela. `Esc` ou um clique fora fecham só a
+  lista. A roda do mouse sobre o cartão ou a lista também muda o volume.
 - **Bateria** dos dispositivos e **player de mídia** (o que estiver tocando).
 - **Abas:** *Recursos* (CPU, GPU e memória), *Calendário* e *Speed test* (ping, download e upload).
-- **⚙ Cores:** cor de destaque (presets, a cor de destaque do Windows) e tom do vidro (escuro, claro ou destaque).
+- **⚙ Cores:** cor de destaque (presets, a cor de destaque do Windows), tom do vidro (escuro, claro ou destaque) e uma
+  barra de **Transparência** (0–100%, padrão 45%) que age na hora enquanto você arrasta. O vidro é acrylic do Windows.
 
 A escolha fica em `%APPDATA%\battery-bar\config`, um arquivo de texto com `chave=valor` por linha
 (`#` começa um comentário):
@@ -39,10 +42,13 @@ A escolha fica em `%APPDATA%\battery-bar\config`, um arquivo de texto com `chave
 ```
 accent=preset:0      # preset:0..7, windows ou #RRGGBB
 tint=dark            # dark, light ou accent
+transparency=45      # 0 a 100 (mais alto = mais transparente)
 ```
 
 Valores inválidos são ignorados e ficam os padrões. Escolher uma cor no ⚙ regrava o arquivo inteiro:
-comentários escritos à mão se perdem. O consumo do painel ainda não foi medido.
+comentários escritos à mão se perdem. 
+Consumo medido (memória privada, a coluna "Memória" do Gerenciador de Tarefas, com `tools/medir-memoria.ps1`):
+fechado ~2,8 MB, aberto ~17,7 MB e fechado de novo ~1,7 MB depois de 10 ciclos de abrir e fechar.
 
 ## Instalar
 

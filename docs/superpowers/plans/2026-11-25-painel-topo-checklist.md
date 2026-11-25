@@ -5,15 +5,15 @@ mouse estava em uso. Antes de testar, feche a instância atual (bandeja → Sair
 `target\release\battery-bar.exe`.
 
 ## Abrir e fechar
-- [ ] Mouse 1,5 s parado na borda de cima → o painel desce centralizado, com vidro fosco
+- [ ] Mouse 0,5 s parado na borda de cima → o painel desce centralizado, com vidro fosco
   escuro e o papel de parede desfocado atrás.
-- [ ] Mouse 1 s no topo e depois clicar numa aba do Chrome maximizado → **não** abre.
+- [ ] Mouse 0,4 s no topo e depois clicar numa aba do Chrome maximizado → **não** abre.
 - [ ] Arrastar uma janela até o topo (aparece o Snap) → **não** abre.
 - [ ] Jogo ou vídeo em tela cheia (F11 no YouTube) → **não** abre.
 - [ ] Fecha com Esc, com um clique fora (a janela clicada fica com o foco) e com o mouse
   fora por 0,5 s depois de ter entrado.
 - [ ] Esc com o mouse ainda no topo, esperando mais de 2 s → **não** reabre. Sair e voltar à
-  borda por 1,5 s → abre.
+  borda por 0,5 s → abre.
 - [ ] Ao abrir, digitar já vai pra busca. Ao fechar com Esc, o foco volta pra janela anterior.
 - [ ] Bandeja → "Abrir painel" (primeiro item) abre. Sem passar o mouse por ele, não fecha
   sozinho; Esc e clique fora fecham.
@@ -27,6 +27,9 @@ mouse estava em uso. Antes de testar, feche a instância atual (bandeja → Sair
 - [ ] A altura acompanha o conteúdo, sem faixa vazia e sem nada cortado. O hover nos botões
   aparece e some.
 - [ ] Os cantos são todos arredondados (o Windows não deixa arredondar só os de baixo).
+- [ ] ⚙ → barra de Transparência: arrastar muda o vidro na hora (0% quase opaco, 100% só o
+  desfoque); soltar salva `transparency=N` no config. Arrastar e sair do painel com o botão
+  apertado → **não** fecha; ao soltar fora, fecha 0,5 s depois.
 - [ ] ⚙ → trocar a cor e o tom do vidro → muda na hora. Fechar e abrir de novo → continua.
   O arquivo `%APPDATA%\battery-bar\config` existe e dá pra editar à mão.
 - [ ] Escolher "Usar a cor do Windows" e trocar a cor no Windows com o painel aberto → o
@@ -44,8 +47,10 @@ mouse estava em uso. Antes de testar, feche a instância atual (bandeja → Sair
 - [ ] O Bluetooth mostra "1 conectado" com o DualSense. Clicar desliga/liga.
 - [ ] Seta ou clique direito no Wi‑Fi/BT → Configurações abre **na frente**, na página certa.
 - [ ] Roda do mouse no áudio → volume ±2% por clique da roda. Clicar → mudo.
-- [ ] Seta do áudio → lista de saídas. Escolher o fone USB → o som vai pra ele. Clique
-  direito → Configurações > Som.
+- [ ] Seta do áudio → lista suspensa sob o cartão (as abas continuam abaixo). A barra de
+  volume muda o volume ao clicar e ao arrastar; a roda sobre a lista também. A saída atual
+  tem ✓. Escolher o fone USB → o som vai pra ele e a lista fecha. Um clique fora da lista só a
+  fecha; Esc fecha só a lista (o segundo Esc fecha o painel). Clique direito → Configurações > Som.
 
 ## Bateria e player
 - [ ] O cartão de bateria mostra o mesmo que a faixa (%, raio, vermelho quando baixo, `--%`).
@@ -64,8 +69,8 @@ mouse estava em uso. Antes de testar, feche a instância atual (bandeja → Sair
   desligado → `Sem conexão`.
 
 ## Consumo (coluna "Memória" do Gerenciador de Tarefas)
-- [ ] Anote o valor com o painel fechado logo ao iniciar, com ele aberto em cada aba, e
-  fechado de novo depois de 10 ciclos de abrir/fechar passando por todas as abas.
-  Meta: fechado ≤ ~8 MB, aberto ≤ ~20 MB.
+- [x] Medido com `tools/medir-memoria.ps1` (aba Recursos): fechado 2,8 MB, aberto 17,7 MB,
+  fechado depois de 10 ciclos 1,7 MB. Meta: fechado ≤ ~8 MB, aberto ≤ ~20 MB.
+- [ ] Anote também o valor aberto nas abas Calendário e Speed test (o script só mede Recursos).
 - [ ] Com o painel fechado ou noutra aba → CPU do battery-bar ~0%.
-- [ ] Depois de medir, atualize a linha de consumo do README.
+- [x] Linha de consumo do README atualizada.
