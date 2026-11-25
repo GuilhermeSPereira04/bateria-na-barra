@@ -17,6 +17,30 @@ Mostra na barra de tarefas do Windows 11, à esquerda da bandeja, a bateria de:
   **Atualizar agora**, **Iniciar com o Windows**, **Sair**.
 - Leve: ~4 MB de memória, CPU ~0% em repouso. Leituras: mouse e controle a cada 60 s, celular a cada 3 min.
 
+## Painel do topo
+
+Um painel de vidro que desce do topo da tela, no monitor principal.
+
+- **Abrir:** deixe o mouse na borda de cima da tela por 1,5 s, ou use **Abrir painel** no menu da bandeja.
+  Fecha com `Esc`, clicando fora ou quando perde o foco.
+- **Busca de apps:** é só digitar com o painel aberto; `Enter` abre o resultado.
+- **Atalhos rápidos:** Wi-Fi, Bluetooth e áudio. Clique liga/desliga; clique com o botão direito (ou na seta)
+  abre a página correspondente das Configurações do Windows. A seta do áudio abre a lista de saídas e a
+  roda do mouse sobre ele muda o volume.
+- **Bateria** dos dispositivos e **player de mídia** (o que estiver tocando).
+- **Abas:** *Recursos* (CPU, GPU e memória), *Calendário* e *Speed test* (ping, download e upload).
+- **⚙ Cores:** cor de destaque (presets, a cor de destaque do Windows) e tom do vidro (escuro, claro ou destaque).
+
+A escolha fica em `%APPDATA%\battery-bar\config`, um arquivo de texto com `chave=valor` por linha
+(`#` começa um comentário):
+
+```
+accent=preset:0      # preset:0..7, windows ou #RRGGBB
+tint=dark            # dark, light ou accent
+```
+
+Valores inválidos são ignorados e ficam os padrões. O consumo do painel ainda não foi medido.
+
 ## Instalar
 
 1. Compile (veja abaixo) ou use o `.exe` já gerado em `target\release\battery-bar.exe`.
