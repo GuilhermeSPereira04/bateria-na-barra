@@ -21,6 +21,7 @@ const ERROR: u32 = 0xFF6B5E;
 /// Text over an accent fill (accents are light colors).
 const ON_ACCENT: u32 = 0x0E1A12;
 const UNAVAILABLE: f32 = 0.45;
+const ACCENT_WINDOWS: &str = "Usar a cor do Windows";
 
 const GLYPH_SEARCH: char = '\u{E721}';
 const GLYPH_GEAR: char = '\u{E713}';
@@ -245,7 +246,7 @@ fn colors_row(p: &Painter, colors: &Colors, l: &Layout) {
     }
     if let Some(r) = l.rect(Hit::AccentWindows) {
         p.fill(r, white(CARD));
-        p.text("Cor do Windows", &p.f.text, r, Align::Center, white(0.92));
+        p.text(ACCENT_WINDOWS, &p.f.text, r, Align::Center, white(0.92));
     }
     let selected = tint_index(colors);
     for (i, name) in ["Escuro", "Claro", "Destaque"].into_iter().enumerate() {
@@ -638,6 +639,21 @@ mod tests {
             let s = scale(view.dpi);
             assert!(alpha(2, 2) > 0, "tint");
             assert!(alpha((100.0 * s) as i32, (20.0 * s) as i32) > alpha(2, 2), "search card");
+        }
+    }
+
+    #[test]
+    fn accent_windows_label_fits() {
+        let dw: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).unwrap() };
+        for dpi in [96, 144] {
+            let view = PanelView { dpi, gear_open: true, ..Default::default() };
+            let r = layout(&view).rect(Hit::AccentWindows).unwrap();
+            let fonts = Fonts::new(&dw, scale(dpi)).unwrap();
+            let wide: Vec<u16> = ACCENT_WINDOWS.encode_utf16().collect();
+            let mut m = DWRITE_TEXT_METRICS::default();
+            unsafe { dw.CreateTextLayout(&wide, &fonts.text, 10_000.0, 100.0).unwrap().GetMetrics(&mut m).unwrap() };
+            let room = r.right - r.left - 2.0 * 8.0 * scale(dpi);
+            assert!(m.width <= room, "dpi {dpi}: text {} > room {room}", m.width);
         }
     }
 

@@ -33,6 +33,9 @@ const MEDIA_BTN: f32 = 36.0;
 const TABS_H: f32 = 28.0;
 const TAB_W: f32 = 96.0;
 const BODY_H: f32 = 220.0;
+/// Fits "Usar a cor do Windows" with room on both sides; the gear row then
+/// takes 716 of the 728 DIP available.
+const ACCENT_WINDOWS_W: f32 = 172.0;
 /// Height of a row in the results / output list.
 pub const ROW_H: f32 = 30.0;
 pub const MAX_ROWS: usize = 8;
@@ -63,8 +66,8 @@ pub fn layout(view: &PanelView) -> Layout {
             x += 32.0;
         }
         x += 16.0;
-        regions.push((r(x, y, 132.0, COLOR_ROW_H), Hit::AccentWindows));
-        x += 132.0 + 16.0;
+        regions.push((r(x, y, ACCENT_WINDOWS_W, COLOR_ROW_H), Hit::AccentWindows));
+        x += ACCENT_WINDOWS_W + 16.0;
         for i in 0..3 {
             regions.push((r(x, y, 80.0, COLOR_ROW_H), Hit::Tint(i)));
             x += 80.0 + GAP;
