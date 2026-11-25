@@ -36,6 +36,11 @@ pub const WM_PANEL_CLOSED: u32 = WM_APP + 11;
 const WIDTH_DIP: i32 = 760;
 const HEIGHT_DIP: i32 = 420;
 
+/// True when `pt` is on the top row of `monitor` (not on a monitor stacked above it).
+pub fn on_top_edge(pt: POINT, monitor: RECT) -> bool {
+    pt.y == monitor.top && pt.x >= monitor.left && pt.x < monitor.right
+}
+
 /// Horizontally centered on `monitor`, glued to its top edge; never wider than it.
 pub fn panel_rect(monitor: RECT, width_px: i32, height_px: i32) -> RECT {
     let monitor_w = monitor.right - monitor.left;
@@ -306,6 +311,15 @@ mod tests {
     fn panel_centered_at_top() {
         let r = panel_rect(MONITOR, 760, 420);
         assert_eq!((r.left, r.top, r.right, r.bottom), (580, 0, 1340, 420));
+    }
+
+    #[test]
+    fn top_edge_only_on_primary_top_row() {
+        assert!(on_top_edge(POINT { x: 960, y: 0 }, MONITOR));
+        assert!(!on_top_edge(POINT { x: 960, y: 1 }, MONITOR)); // inside, below the top
+        assert!(!on_top_edge(POINT { x: 960, y: -500 }, MONITOR)); // monitor stacked above
+        assert!(!on_top_edge(POINT { x: 1920, y: 0 }, MONITOR)); // right of the primary
+        assert!(!on_top_edge(POINT { x: -1, y: 0 }, MONITOR));
     }
 
     #[test]

@@ -149,8 +149,7 @@ impl App {
         if unsafe { GetCursorPos(&mut pt) }.is_err() {
             return; // secure desktop (lock screen, UAC)
         }
-        let mon = taskbar::primary_monitor_rect();
-        let at_top_edge = pt.y <= mon.top && pt.x >= mon.left && pt.x < mon.right;
+        let at_top_edge = crate::panel::on_top_edge(pt, taskbar::primary_monitor_rect());
         let button_down =
             unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 || GetAsyncKeyState(VK_RBUTTON.0 as i32) < 0 };
         let now = Instant::now();
