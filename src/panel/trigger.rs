@@ -40,6 +40,26 @@ impl EdgeTrigger {
         }
         false
     }
+
+    /// Holds the trigger as already fired: it opens again only after the
+    /// cursor has left the edge. Called while the panel is open and on close,
+    /// so closing it with the cursor still on the top row does not reopen it.
+    pub fn suppress(&mut self) {
+        self.fired = true;
+        self.since = None;
+    }
+}
+
+/// A mouse press since the last tick: the button went down, or Windows saw a
+/// whole click between two ticks (`recent`, the low bit of `GetAsyncKeyState`).
+pub fn new_press(was_down: bool, down: bool, recent: bool) -> bool {
+    (down && !was_down) || recent
+}
+
+/// A panel that never got the focus hears neither `Esc` nor `WA_INACTIVE`:
+/// a press outside it closes it anyway.
+pub fn click_outside_closes(focused: bool, pressed: bool, inside: bool) -> bool {
+    !focused && pressed && !inside
 }
 
 /// Conditions that keep the panel open regardless of the cursor.
@@ -132,6 +152,39 @@ mod tests {
         }
         assert!(!e.update(true, false, t0 + ms(5000)));
         assert!(e.update(true, false, t0 + ms(6500)));
+    }
+
+    #[test]
+    fn no_reopen_without_leaving_edge() {
+        let t0 = Instant::now();
+        let mut e = EdgeTrigger::new();
+        // The cursor reaches the edge while the panel is open, which then closes.
+        e.update(true, false, t0);
+        e.suppress();
+        for s in 1..=5 {
+            assert!(!e.update(true, false, t0 + Duration::from_secs(s)));
+        }
+        // Leaving the edge re-arms it.
+        assert!(!e.update(false, false, t0 + ms(5100)));
+        assert!(!e.update(true, false, t0 + ms(5200)));
+        assert!(e.update(true, false, t0 + ms(6700)));
+    }
+
+    #[test]
+    fn press_detection() {
+        assert!(new_press(false, true, false)); // went down
+        assert!(!new_press(true, true, false)); // still held
+        assert!(new_press(false, false, true)); // a whole click between ticks
+        assert!(!new_press(false, false, false));
+        assert!(!new_press(true, false, false)); // released
+    }
+
+    #[test]
+    fn unfocused_panel_closes_on_click_outside() {
+        assert!(click_outside_closes(false, true, false));
+        assert!(!click_outside_closes(false, true, true)); // a click on the panel
+        assert!(!click_outside_closes(true, true, false)); // focused: WA_INACTIVE handles it
+        assert!(!click_outside_closes(false, false, false)); // no press
     }
 
     #[test]

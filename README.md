@@ -22,11 +22,12 @@ Mostra na barra de tarefas do Windows 11, à esquerda da bandeja, a bateria de:
 Um painel de vidro que desce do topo da tela, no monitor principal.
 
 - **Abrir:** deixe o mouse na borda de cima da tela por 1,5 s, ou use **Abrir painel** no menu da bandeja.
-  Fecha com `Esc`, clicando fora ou quando perde o foco.
+  Fecha com `Esc`, clicando fora ou quando perde o foco, e sozinho ~0,5 s depois que o mouse sai dele
+  (isso fica pausado enquanto há texto na busca, durante o speed test ou com o ⚙ ou a lista de áudio aberta).
 - **Busca de apps:** é só digitar com o painel aberto; `Enter` abre o resultado.
-- **Atalhos rápidos:** Wi-Fi, Bluetooth e áudio. Clique liga/desliga; clique com o botão direito (ou na seta)
-  abre a página correspondente das Configurações do Windows. A seta do áudio abre a lista de saídas e a
-  roda do mouse sobre ele muda o volume.
+- **Atalhos rápidos:** Wi-Fi, Bluetooth e áudio. Clique liga/desliga (no áudio, muta); clique com o botão
+  direito abre a página correspondente das Configurações do Windows. No Wi-Fi e no Bluetooth a seta faz o
+  mesmo; no áudio a seta abre a lista de saídas, e a roda do mouse sobre ele muda o volume.
 - **Bateria** dos dispositivos e **player de mídia** (o que estiver tocando).
 - **Abas:** *Recursos* (CPU, GPU e memória), *Calendário* e *Speed test* (ping, download e upload).
 - **⚙ Cores:** cor de destaque (presets, a cor de destaque do Windows) e tom do vidro (escuro, claro ou destaque).
@@ -39,7 +40,8 @@ accent=preset:0      # preset:0..7, windows ou #RRGGBB
 tint=dark            # dark, light ou accent
 ```
 
-Valores inválidos são ignorados e ficam os padrões. O consumo do painel ainda não foi medido.
+Valores inválidos são ignorados e ficam os padrões. Escolher uma cor no ⚙ regrava o arquivo inteiro:
+comentários escritos à mão se perdem. O consumo do painel ainda não foi medido.
 
 ## Instalar
 

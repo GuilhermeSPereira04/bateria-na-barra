@@ -20,7 +20,7 @@ use crate::calendar;
 use crate::config::{self, Accent, Colors, Config, GlassTint};
 use crate::media::{self, MediaCmd, NowPlaying};
 use crate::model::{ALL, DeviceKind, ReadOutcome, Tracker};
-use crate::panel::trigger::{CloseRule, EdgeTrigger, Pauses};
+use crate::panel::trigger::{CloseRule, EdgeTrigger, Pauses, click_outside_closes, new_press};
 use crate::panel::layout::MAX_ROWS;
 use crate::panel::view::{Hit, Key, PanelView, QuickState, Tab, Toggle};
 use crate::panel::{
@@ -111,6 +111,8 @@ struct App {
     panel: Option<PanelWindow>,
     edge: EdgeTrigger,
     close: CloseRule,
+    /// A mouse button was down at the last `TIMER_EDGE` tick.
+    button_was_down: bool,
     tab: Tab,
     gear_open: bool,
     /// Month shown on the calendar tab (year, 1..=12).
@@ -165,6 +167,9 @@ impl App {
     }
 
     fn menu(&mut self, hwnd: HWND) {
+        // The menu makes the owner foreground and runs a nested loop that
+        // drops the panel's own close request (APP is borrowed): close it here.
+        self.close_panel();
         match tray::show_menu(hwnd, startup::is_enabled()) {
             tray::CMD_REFRESH => {
                 for r in &self.refresh {
@@ -203,6 +208,10 @@ impl App {
         if let Ok(panel) = PanelWindow::open(hwnd, self.panel_view()) {
             self.panel = Some(panel);
             self.close = CloseRule::new(); // disarmed until the cursor enters
+            // Forget presses from before the panel (the menu click that opened
+            // it): reading the buttons also clears their "pressed since" bit.
+            let (left, right) = unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32), GetAsyncKeyState(VK_RBUTTON.0 as i32)) };
+            self.button_was_down = left < 0 || right < 0;
             self.apps_rx = Some(apps::enumerate_async(hwnd));
             self.radios_rx = Some(radios::spawn(hwnd, || {}));
             self.read_audio(hwnd);
@@ -226,8 +235,10 @@ impl App {
         }
     }
 
-    /// Every `TIMER_STATS` tick.
+    /// Every `TIMER_STATS` tick. Takes a sample whose `ASYNC_STATS` was lost
+    /// (in a nested message loop) first, so `request` is never stuck pending.
     fn stats_tick(&mut self) {
+        self.on_stats();
         if let Some(sampler) = self.sampler.as_mut() {
             sampler.request();
         }
@@ -282,8 +293,10 @@ impl App {
         self.media_rx = Some(media::spawn(hwnd, cmd, self.media.clone()));
     }
 
-    /// Every `TIMER_MEDIA` tick; skipped while a read is still pending.
+    /// Every `TIMER_MEDIA` tick; skipped while a read is still pending. Takes
+    /// a read whose `ASYNC_MEDIA` was lost (in a nested message loop) first.
     fn media_tick(&mut self, hwnd: HWND) {
+        self.on_media();
         if self.panel.is_some() && self.media_rx.is_none() {
             self.read_media(hwnd, None);
         }
@@ -529,6 +542,8 @@ impl App {
             return;
         }
         self.panel = None;
+        // Reopening from the edge takes leaving it first (Esc on the top row).
+        self.edge.suppress();
         // The app list and its icons only live while the panel is open.
         self.catalog = None;
         self.apps_rx = None;
@@ -555,16 +570,35 @@ impl App {
             return; // secure desktop (lock screen, UAC)
         }
         let at_top_edge = crate::panel::on_top_edge(pt, taskbar::primary_monitor_rect());
-        let button_down =
-            unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 || GetAsyncKeyState(VK_RBUTTON.0 as i32) < 0 };
+        let (left, right) = unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32), GetAsyncKeyState(VK_RBUTTON.0 as i32)) };
+        let button_down = left < 0 || right < 0;
+        let pressed = new_press(self.button_was_down, button_down, (left | right) & 1 != 0);
+        self.button_was_down = button_down;
         let now = Instant::now();
+        if self.panel.is_some() {
+            self.edge.suppress(); // no counting toward a reopen while open
+        }
         if self.edge.update(at_top_edge, button_down, now) && self.panel.is_none() && !taskbar::fullscreen_now() {
             self.open_panel(hwnd);
+            return; // the presses above came before it
         }
+        if self.panel.is_none() {
+            return;
+        }
+        // Results whose WM_PANEL_ASYNC was lost in a nested message loop.
+        self.on_apps();
+        self.on_radios();
+        self.on_audio();
+        self.on_speed();
         let Some(panel) = &self.panel else { return };
+        let panel_hwnd = panel.hwnd();
         let mut r = RECT::default();
-        let _ = unsafe { GetWindowRect(panel.hwnd(), &mut r) };
+        let _ = unsafe { GetWindowRect(panel_hwnd, &mut r) };
         let inside = pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom;
+        let focused = unsafe { GetForegroundWindow() } == panel_hwnd;
+        if click_outside_closes(focused, pressed, inside) {
+            return self.close_panel();
+        }
         let pauses = Pauses {
             search_text: !self.query.is_empty(),
             speedtest_running: matches!(self.speed, SpeedState::Running { .. }),
@@ -741,6 +775,7 @@ pub fn run() -> windows::core::Result<()> {
                 panel: None,
                 edge: EdgeTrigger::new(),
                 close: CloseRule::new(),
+                button_was_down: false,
                 tab: Tab::Resources,
                 gear_open: false,
                 month: (0, 1),

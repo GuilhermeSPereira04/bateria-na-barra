@@ -21,7 +21,7 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint, PAINTSTRUCT, ScreenToClient,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -381,12 +381,18 @@ fn primary_dpi() -> u32 {
 }
 
 /// Moves the keyboard focus to `hwnd` without injecting input: borrow the
-/// active thread's input state so `SetForegroundWindow` is allowed.
+/// active thread's input state so `SetForegroundWindow` is allowed. A hung
+/// foreground thread (attaching could freeze ours) or one of our own process
+/// is not attached; `SetForegroundWindow` is then just tried alone.
 fn take_focus(hwnd: HWND, previous: HWND) {
     unsafe {
-        let fg_thread = if previous.is_invalid() { 0 } else { GetWindowThreadProcessId(previous, None) };
+        let mut pid = 0u32;
+        let fg_thread = if previous.is_invalid() { 0 } else { GetWindowThreadProcessId(previous, Some(&mut pid)) };
         let me = GetCurrentThreadId();
-        let attach = fg_thread != 0 && fg_thread != me;
+        let attach = fg_thread != 0
+            && fg_thread != me
+            && pid != GetCurrentProcessId()
+            && !IsHungAppWindow(previous).as_bool();
         if attach {
             let _ = AttachThreadInput(fg_thread, me, true);
         }
