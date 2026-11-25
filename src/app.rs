@@ -4,18 +4,22 @@ use std::cell::RefCell;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
 use crate::model::{ALL, DeviceKind, ReadOutcome, Tracker};
+use crate::panel::trigger::{CloseRule, EdgeTrigger, Pauses};
+use crate::panel::{PanelWindow, WM_PANEL_CLOSED};
 use crate::readers::{self, WM_READING};
 use crate::render::Strip;
 use crate::taskbar::{StripWindow, WM_STRIP_CLICK};
 use crate::tray::{self, Tray, WM_TRAY};
-use crate::{startup, theme};
+use crate::{startup, taskbar, theme};
 
 const TIMER_SYNC: usize = 1; // 1 s: keep the strip placed and on top
 /// Posted by the WinEvent hooks when the taskbar moves (auto-hide slide,
@@ -67,6 +71,8 @@ fn hook_taskbar_moves(previous: Option<HWINEVENTHOOK>) -> Option<HWINEVENTHOOK> 
     }
 }
 const TIMER_EXPIRE: usize = 2; // 60 s: let held values expire
+const TIMER_EDGE: usize = 3; // 100 ms: watch the top edge and the open panel
+// Reserved for the panel: TIMER_STATS = 4, TIMER_MEDIA = 5.
 const TRAY_GLYPH: char = '\u{E83F}';
 const TRAY_ICON_PX: i32 = 32;
 
@@ -79,6 +85,9 @@ struct App {
     taskbar_created: u32,
     dark: bool,
     hook: Option<HWINEVENTHOOK>,
+    panel: Option<PanelWindow>,
+    edge: EdgeTrigger,
+    close: CloseRule,
 }
 
 thread_local! {
@@ -100,6 +109,7 @@ impl App {
                     let _ = r.send(());
                 }
             }
+            tray::CMD_PANEL => self.open_panel(hwnd),
             tray::CMD_STARTUP => {
                 let _ = startup::set_enabled(!startup::is_enabled());
             }
@@ -109,6 +119,51 @@ impl App {
                 let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
             },
             _ => {}
+        }
+    }
+
+    fn open_panel(&mut self, hwnd: HWND) {
+        if self.panel.is_some() {
+            return;
+        }
+        if let Ok(panel) = PanelWindow::open(hwnd) {
+            self.panel = Some(panel);
+            self.close = CloseRule::new(); // disarmed until the cursor enters
+        }
+    }
+
+    fn close_panel(&mut self) {
+        if self.panel.is_none() {
+            return;
+        }
+        self.panel = None;
+        // Hand the pages the panel touched back to the system.
+        unsafe {
+            let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+        }
+    }
+
+    /// Every `TIMER_EDGE` tick: open on a held top edge, close once the cursor left.
+    fn edge_tick(&mut self, hwnd: HWND) {
+        let mut pt = POINT::default();
+        if unsafe { GetCursorPos(&mut pt) }.is_err() {
+            return; // secure desktop (lock screen, UAC)
+        }
+        let mon = taskbar::primary_monitor_rect();
+        let at_top_edge = pt.y <= mon.top && pt.x >= mon.left && pt.x < mon.right;
+        let button_down =
+            unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 || GetAsyncKeyState(VK_RBUTTON.0 as i32) < 0 };
+        let now = Instant::now();
+        if self.edge.update(at_top_edge, button_down, now) && self.panel.is_none() && !taskbar::fullscreen_now() {
+            self.open_panel(hwnd);
+        }
+        let Some(panel) = &self.panel else { return };
+        let mut r = RECT::default();
+        let _ = unsafe { GetWindowRect(panel.hwnd(), &mut r) };
+        let inside = pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom;
+        // Pauses come from the panel's state (search text, speed test, popups) once it has one.
+        if self.close.update(inside, Pauses::default(), now) {
+            self.close_panel();
         }
     }
 }
@@ -144,6 +199,13 @@ unsafe extern "system" fn owner_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         }),
         WM_TIMER if wp.0 == TIMER_SYNC => with_app(|app| app.strip.sync()),
         WM_TIMER if wp.0 == TIMER_EXPIRE => with_app(|app| app.rebuild()),
+        WM_TIMER if wp.0 == TIMER_EDGE => with_app(|app| app.edge_tick(hwnd)),
+        // Ignore a late request from a panel that is already gone.
+        WM_PANEL_CLOSED => with_app(|app| {
+            if app.panel.as_ref().is_some_and(|p| p.hwnd().0 as usize == wp.0) {
+                app.close_panel();
+            }
+        }),
         WM_STRIP_CLICK => with_app(|app| app.menu(hwnd)),
         WM_TRAY if is_click(lp.0 as u32) => with_app(|app| app.menu(hwnd)),
         WM_SETTINGCHANGE => {
@@ -159,6 +221,9 @@ unsafe extern "system" fn owner_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         }
         WM_TASKBAR_MOVED => with_app(|app| app.strip.sync()),
         WM_DISPLAYCHANGE | WM_DPICHANGED => with_app(|app| {
+            if msg == WM_DISPLAYCHANGE {
+                app.close_panel();
+            }
             app.strip.invalidate();
             app.strip.sync();
         }),
@@ -221,13 +286,25 @@ pub fn run() -> windows::core::Result<()> {
         OWNER.store(hwnd.0 as isize, std::sync::atomic::Ordering::Relaxed);
         let hook = hook_taskbar_moves(None);
         APP.with(|cell| {
-            *cell.borrow_mut() =
-                Some(App { tracker: Tracker::new(), strip, tray, rx, refresh, taskbar_created, dark, hook });
+            *cell.borrow_mut() = Some(App {
+                tracker: Tracker::new(),
+                strip,
+                tray,
+                rx,
+                refresh,
+                taskbar_created,
+                dark,
+                hook,
+                panel: None,
+                edge: EdgeTrigger::new(),
+                close: CloseRule::new(),
+            });
         });
         with_app(|app| app.rebuild());
 
         SetTimer(Some(hwnd), TIMER_SYNC, 1000, None);
         SetTimer(Some(hwnd), TIMER_EXPIRE, 60_000, None);
+        SetTimer(Some(hwnd), TIMER_EDGE, 100, None);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {

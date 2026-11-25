@@ -4,8 +4,8 @@
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    MonitorFromWindow,
+    AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
+    MONITORINFO, MonitorFromPoint, MonitorFromWindow,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
@@ -195,6 +195,21 @@ fn foreground_is_fullscreen(own: HWND, monitor: RECT) -> bool {
         }
         is_fullscreen(r, GetWindowLongW(fg, GWL_STYLE) as u32, monitor)
     }
+}
+
+/// The primary monitor's rectangle, in physical pixels.
+pub fn primary_monitor_rect() -> RECT {
+    unsafe {
+        let mon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let _ = GetMonitorInfoW(mon, &mut mi);
+        mi.rcMonitor
+    }
+}
+
+/// True when a game, video or presentation runs fullscreen on the primary monitor.
+pub fn fullscreen_now() -> bool {
+    fullscreen_active(foreground_is_fullscreen(HWND::default(), primary_monitor_rect()), shell_state())
 }
 
 pub struct StripWindow {

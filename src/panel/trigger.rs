@@ -1,5 +1,4 @@
 //! Pure timing rules for the top panel: edge-hold trigger and close rule.
-#![allow(dead_code)]
 
 use std::time::{Duration, Instant};
 

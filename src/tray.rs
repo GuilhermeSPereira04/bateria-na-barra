@@ -12,6 +12,7 @@ pub const WM_TRAY: u32 = WM_APP + 3;
 pub const CMD_REFRESH: u32 = 1;
 pub const CMD_STARTUP: u32 = 2;
 pub const CMD_QUIT: u32 = 3;
+pub const CMD_PANEL: u32 = 4;
 
 pub struct Tray {
     hwnd: HWND,
@@ -87,6 +88,7 @@ pub fn show_menu(hwnd: HWND, startup_on: bool) -> u32 {
             let flags = if checked { MF_STRING | MF_CHECKED } else { MF_STRING };
             let _ = AppendMenuW(menu, flags, id as usize, PCWSTR(wide.as_ptr()));
         };
+        item(CMD_PANEL, "Abrir painel", false);
         item(CMD_REFRESH, "Atualizar agora", false);
         item(CMD_STARTUP, "Iniciar com o Windows", startup_on);
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
