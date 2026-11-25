@@ -14,7 +14,8 @@ use windows::core::{PCWSTR, w};
 
 use crate::model::{ALL, DeviceKind, ReadOutcome, Tracker};
 use crate::panel::trigger::{CloseRule, EdgeTrigger, Pauses};
-use crate::panel::{PanelWindow, WM_PANEL_CLOSED};
+use crate::panel::view::{Hit, PanelView, Tab};
+use crate::panel::{PanelWindow, WM_PANEL_CLOSED, WM_PANEL_HIT};
 use crate::readers::{self, WM_READING};
 use crate::render::Strip;
 use crate::taskbar::{StripWindow, WM_STRIP_CLICK};
@@ -88,6 +89,8 @@ struct App {
     panel: Option<PanelWindow>,
     edge: EdgeTrigger,
     close: CloseRule,
+    tab: Tab,
+    gear_open: bool,
 }
 
 thread_local! {
@@ -100,6 +103,7 @@ impl App {
         let items = ALL.iter().map(|&k| (k, self.tracker.view(k, now))).collect();
         self.strip.set_strip(Strip { items, dark: self.dark });
         self.tray.set_tip(&self.tracker.tooltip(now));
+        self.refresh_panel();
     }
 
     fn menu(&mut self, hwnd: HWND) {
@@ -126,10 +130,44 @@ impl App {
         if self.panel.is_some() {
             return;
         }
-        if let Ok(panel) = PanelWindow::open(hwnd) {
+        // Every opening starts on the first tab, with the colors row closed.
+        self.tab = Tab::Resources;
+        self.gear_open = false;
+        if let Ok(panel) = PanelWindow::open(hwnd, self.panel_view()) {
             self.panel = Some(panel);
             self.close = CloseRule::new(); // disarmed until the cursor enters
         }
+    }
+
+    /// Everything the panel shows, from the current state.
+    fn panel_view(&self) -> PanelView {
+        let now = Instant::now();
+        PanelView {
+            battery: ALL.iter().map(|&k| (k, self.tracker.view(k, now))).collect(),
+            tab: self.tab,
+            gear_open: self.gear_open,
+            ..Default::default()
+        }
+    }
+
+    fn refresh_panel(&mut self) {
+        if self.panel.is_none() {
+            return;
+        }
+        let view = self.panel_view();
+        if let Some(panel) = self.panel.as_mut() {
+            panel.redraw(view);
+        }
+    }
+
+    /// A click on the panel. The other hits are wired by the tasks that give them data.
+    fn on_hit(&mut self, hit: Hit) {
+        match hit {
+            Hit::Tab(tab) => self.tab = tab,
+            Hit::Gear => self.gear_open = !self.gear_open,
+            _ => return,
+        }
+        self.refresh_panel();
     }
 
     fn close_panel(&mut self) {
@@ -203,6 +241,11 @@ unsafe extern "system" fn owner_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         WM_PANEL_CLOSED => with_app(|app| {
             if app.panel.as_ref().is_some_and(|p| p.hwnd().0 as usize == wp.0) {
                 app.close_panel();
+            }
+        }),
+        WM_PANEL_HIT => with_app(|app| {
+            if let Some(hit) = app.panel.as_ref().and_then(|p| p.take_click()) {
+                app.on_hit(hit);
             }
         }),
         WM_STRIP_CLICK => with_app(|app| app.menu(hwnd)),
@@ -297,6 +340,8 @@ pub fn run() -> windows::core::Result<()> {
                 panel: None,
                 edge: EdgeTrigger::new(),
                 close: CloseRule::new(),
+                tab: Tab::Resources,
+                gear_open: false,
             });
         });
         with_app(|app| app.rebuild());

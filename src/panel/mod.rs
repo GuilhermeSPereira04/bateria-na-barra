@@ -1,11 +1,14 @@
 //! The top panel: a popup with the Windows 11 system backdrop (frosted glass)
 //! drawn over with Direct2D. Created on open and destroyed on close, so no
 //! drawing resources stay allocated while it is closed.
+pub mod draw;
+pub mod layout;
 pub mod trigger;
+pub mod view;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
@@ -19,11 +22,14 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-use windows::Win32::UI::Controls::MARGINS;
+use windows::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
-use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE};
+use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
+
+use layout::{Layout, hit_test};
+use view::{Hit, PanelView};
 
 /// Posted to the owner by panel worker threads when new data is ready
 /// (wParam: which source, see the panel tasks).
@@ -32,9 +38,9 @@ pub const WM_PANEL_ASYNC: u32 = WM_APP + 10;
 /// Posted to the owner when the panel wants to close itself (Esc, click
 /// outside, lost activation). wParam: the panel's HWND.
 pub const WM_PANEL_CLOSED: u32 = WM_APP + 11;
-
-const WIDTH_DIP: i32 = 760;
-const HEIGHT_DIP: i32 = 420;
+/// Posted to the owner after a click on something clickable; the owner
+/// collects it with `PanelWindow::take_click`. wParam: the panel's HWND.
+pub const WM_PANEL_HIT: u32 = WM_APP + 12;
 
 /// True when `pt` is on the top row of `monitor` (not on a monitor stacked above it).
 pub fn on_top_edge(pt: POINT, monitor: RECT) -> bool {
@@ -49,42 +55,111 @@ pub fn panel_rect(monitor: RECT, width_px: i32, height_px: i32) -> RECT {
     RECT { left, top: monitor.top, right: left + width, bottom: monitor.top + height_px }
 }
 
+/// Window rectangle for a layout of `size` pixels on the primary monitor.
+fn rect_for(size: (f32, f32)) -> RECT {
+    panel_rect(crate::taskbar::primary_monitor_rect(), size.0.round() as i32, size.1.round() as i32)
+}
+
 /// Drawing resources; only alive while the panel is open.
 struct Surface {
     d2d: ID2D1Factory,
     dw: IDWriteFactory,
     rt: Option<ID2D1HwndRenderTarget>,
+    cache: draw::Cache,
+}
+
+/// What is shown, and where.
+struct Scene {
+    view: PanelView,
+    layout: Layout,
 }
 
 /// State the window procedure reaches through `GWLP_USERDATA`.
 struct Shared {
     owner: HWND,
-    dpi: u32,
     surface: RefCell<Surface>,
+    scene: RefCell<Scene>,
+    /// The last click, waiting for the owner (see `WM_PANEL_HIT`).
+    click: Cell<Option<Hit>>,
+    /// `TrackMouseEvent` is armed (a `WM_MOUSELEAVE` will come).
+    tracking: Cell<bool>,
+}
+
+fn invalidate(hwnd: HWND) {
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
 }
 
 impl Shared {
     fn paint(&self, hwnd: HWND) {
         // Skip a re-entrant paint; the region stays invalid and is painted again.
-        let Ok(mut s) = self.surface.try_borrow_mut() else { return };
+        let (Ok(mut s), Ok(scene)) = (self.surface.try_borrow_mut(), self.scene.try_borrow()) else { return };
         if s.rt.is_none() {
             s.rt = create_target(&s.d2d, hwnd).ok();
         }
         let Some(rt) = s.rt.clone() else { return };
-        let result = unsafe {
+        let Surface { dw, cache, .. } = &mut *s;
+        let ended = unsafe {
             rt.BeginDraw();
             // Fully transparent: the DWM backdrop shows through.
             rt.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
-            let drawn = draw(&rt, &s.dw, self.dpi);
-            rt.EndDraw(None, None).and(drawn)
+            // A drawing error (a missing font, say) would fail again on every
+            // paint: keep whatever was drawn instead of retrying.
+            let _ = draw::draw(&rt, dw, cache, &scene.view, &scene.layout);
+            rt.EndDraw(None, None)
         };
-        if result.is_err() {
-            // Device lost (D2DERR_RECREATE_TARGET) or similar: rebuild next time.
+        if ended.is_err_and(|e| e.code() == D2DERR_RECREATE_TARGET) {
+            // Device lost: rebuild the target and paint again.
             s.rt = None;
+            s.cache.reset_target();
+            invalidate(hwnd);
+        }
+    }
+
+    fn resize_target(&self, width: u32, height: u32) {
+        let Ok(mut s) = self.surface.try_borrow_mut() else { return };
+        let failed = s.rt.as_ref().is_some_and(|rt| unsafe { rt.Resize(&D2D_SIZE_U { width, height }) }.is_err());
+        if failed {
+            s.rt = None;
+            s.cache.reset_target();
+        }
+    }
+
+    /// Recomputes the layout after `change`; moves/resizes the window when its size changed.
+    fn update(&self, hwnd: HWND, change: impl FnOnce(&mut PanelView)) {
+        let resized = {
+            let Ok(mut scene) = self.scene.try_borrow_mut() else { return };
+            change(&mut scene.view);
+            let layout = layout::layout(&scene.view);
+            let resized = layout.size != scene.layout.size;
+            scene.layout = layout;
+            resized.then_some(scene.layout.size)
+        };
+        if let Some(size) = resized {
+            let r = rect_for(size);
             unsafe {
-                let _ = InvalidateRect(Some(hwnd), None, false);
+                let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
             }
         }
+        invalidate(hwnd);
+    }
+
+    fn set_hover(&self, hwnd: HWND, hover: Option<Hit>) {
+        let changed = self.scene.try_borrow_mut().is_ok_and(|mut scene| {
+            let changed = scene.view.hover != hover;
+            scene.view.hover = hover;
+            changed
+        });
+        if changed {
+            invalidate(hwnd);
+        }
+    }
+
+    fn hit_at(&self, lp: LPARAM) -> Option<Hit> {
+        // Signed client coordinates.
+        let (x, y) = ((lp.0 & 0xFFFF) as i16 as f32, ((lp.0 >> 16) & 0xFFFF) as i16 as f32);
+        self.scene.try_borrow().ok().and_then(|scene| hit_test(&scene.layout, x, y))
     }
 }
 
@@ -95,7 +170,7 @@ fn create_target(d2d: &ID2D1Factory, hwnd: HWND) -> windows::core::Result<ID2D1H
         r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
         // Premultiplied alpha so transparent pixels reveal the system backdrop.
         pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
-        // Draw in physical pixels; the content applies the DPI scale itself.
+        // Draw in physical pixels; the layout applies the DPI scale itself.
         dpiX: 96.0,
         dpiY: 96.0,
         usage: D2D1_RENDER_TARGET_USAGE_NONE,
@@ -109,67 +184,87 @@ fn create_target(d2d: &ID2D1Factory, hwnd: HWND) -> windows::core::Result<ID2D1H
     unsafe { d2d.CreateHwndRenderTarget(&props, &hwnd_props) }
 }
 
-/// Panel content. Placeholder: a search box with its hint text.
-fn draw(rt: &ID2D1HwndRenderTarget, dw: &IDWriteFactory, dpi: u32) -> windows::core::Result<()> {
-    let scale = dpi.max(96) as f32 / 96.0;
-    let px = |dip: f32| dip * scale;
-    unsafe {
-        let size = rt.GetSize();
-        let card = D2D_RECT_F { left: px(16.0), top: px(16.0), right: size.width - px(16.0), bottom: px(16.0 + 36.0) };
-        let fill = rt.CreateSolidColorBrush(&D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.07 }, None)?;
-        rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: card, radiusX: px(8.0), radiusY: px(8.0) }, &fill);
-        let format = dw.CreateTextFormat(
-            w!("Segoe UI Variable Text"),
-            None,
-            DWRITE_FONT_WEIGHT_NORMAL,
-            DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL,
-            px(14.0),
-            w!(""),
-        )?;
-        format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-        let text = D2D_RECT_F { left: card.left + px(12.0), ..card };
-        let hint = rt.CreateSolidColorBrush(&D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 0.6 }, None)?;
-        // ClearType can't blend onto transparent pixels.
-        rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-        let wide: Vec<u16> = "Pesquisar apps…".encode_utf16().collect();
-        rt.DrawText(&wide, &format, &text, &hint, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
-    }
-    Ok(())
-}
-
+/// The `Shared` of a panel window. The reference is only valid while the
+/// window procedure runs: `PanelWindow::drop` clears the pointer before the
+/// box is freed, so it must not be kept across messages.
 fn shared_of(hwnd: HWND) -> Option<&'static Shared> {
     let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const Shared;
-    // Cleared by `PanelWindow::drop` before the box is freed.
     unsafe { ptr.as_ref() }
 }
 
-fn post_closed(hwnd: HWND) {
+fn post_owner(hwnd: HWND, msg: u32) {
     if let Some(shared) = shared_of(hwnd) {
-        let _ = unsafe { PostMessageW(Some(shared.owner), WM_PANEL_CLOSED, WPARAM(hwnd.0 as usize), LPARAM(0)) };
+        let _ = unsafe { PostMessageW(Some(shared.owner), msg, WPARAM(hwnd.0 as usize), LPARAM(0)) };
     }
 }
 
 unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let shared = shared_of(hwnd);
     match msg {
         WM_PAINT => unsafe {
             let mut ps = PAINTSTRUCT::default();
             BeginPaint(hwnd, &mut ps);
-            if let Some(shared) = shared_of(hwnd) {
+            if let Some(shared) = shared {
                 shared.paint(hwnd);
             }
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         },
         WM_ERASEBKGND => LRESULT(1),
+        WM_SIZE => {
+            if let Some(shared) = shared {
+                shared.resize_target((lp.0 & 0xFFFF) as u32, ((lp.0 >> 16) & 0xFFFF) as u32);
+            }
+            LRESULT(0)
+        }
+        // The layout is DPI-driven: re-lay out and resize to it (ignoring the suggested rect).
+        WM_DPICHANGED => {
+            if let Some(shared) = shared {
+                let dpi = (wp.0 & 0xFFFF) as u32;
+                shared.update(hwnd, |view| view.dpi = dpi);
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            if let Some(shared) = shared {
+                if !shared.tracking.get() {
+                    let mut tme = TRACKMOUSEEVENT {
+                        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    shared.tracking.set(unsafe { TrackMouseEvent(&mut tme) }.is_ok());
+                }
+                shared.set_hover(hwnd, shared.hit_at(lp));
+            }
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            if let Some(shared) = shared {
+                shared.tracking.set(false);
+                shared.set_hover(hwnd, None);
+            }
+            LRESULT(0)
+        }
+        // Handled by the owner, outside this window procedure: a click may close the panel.
+        WM_LBUTTONUP => {
+            if let Some(shared) = shared
+                && let Some(hit) = shared.hit_at(lp)
+            {
+                shared.click.set(Some(hit));
+                post_owner(hwnd, WM_PANEL_HIT);
+            }
+            LRESULT(0)
+        }
         // If Windows refused us the foreground on open, a click takes it.
         WM_MOUSEACTIVATE => LRESULT(MA_ACTIVATE as isize),
         WM_KEYDOWN if wp.0 == VK_ESCAPE.0 as usize => {
-            post_closed(hwnd);
+            post_owner(hwnd, WM_PANEL_CLOSED);
             LRESULT(0)
         }
         WM_ACTIVATE if (wp.0 & 0xFFFF) as u32 == WA_INACTIVE => {
-            post_closed(hwnd);
+            post_owner(hwnd, WM_PANEL_CLOSED);
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
@@ -205,13 +300,14 @@ pub struct PanelWindow {
     /// Foreground window before opening; gets the focus back on close.
     previous: HWND,
     /// Owns what the window procedure points at (and the drawing resources).
-    _shared: Box<Shared>,
+    shared: Box<Shared>,
 }
 
 impl PanelWindow {
-    /// Creates, shows and focuses the panel on the primary monitor. Close
-    /// requests are posted to `owner` as `WM_PANEL_CLOSED`.
-    pub fn open(owner: HWND) -> windows::core::Result<Self> {
+    /// Creates, shows and focuses the panel on the primary monitor, showing
+    /// `view` (its `dpi` is set here). Close requests and clicks are posted
+    /// to `owner` as `WM_PANEL_CLOSED` / `WM_PANEL_HIT`.
+    pub fn open(owner: HWND, mut view: PanelView) -> windows::core::Result<Self> {
         unsafe {
             let hinstance = GetModuleHandleW(None)?;
             let class = w!("BatteryBarPanel");
@@ -224,17 +320,21 @@ impl PanelWindow {
             };
             RegisterClassW(&wc); // fails harmlessly when already registered
 
-            let dpi = primary_dpi();
-            let (w_px, h_px) = (WIDTH_DIP * dpi as i32 / 96, HEIGHT_DIP * dpi as i32 / 96);
-            let r = panel_rect(crate::taskbar::primary_monitor_rect(), w_px, h_px);
+            view.dpi = primary_dpi();
+            view.hover = None;
+            let layout = layout::layout(&view);
+            let r = rect_for(layout.size);
             let shared = Box::new(Shared {
                 owner,
-                dpi,
                 surface: RefCell::new(Surface {
                     d2d: D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?,
                     dw: DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?,
                     rt: None,
+                    cache: draw::Cache::new(),
                 }),
+                scene: RefCell::new(Scene { view, layout }),
+                click: Cell::new(None),
+                tracking: Cell::new(false),
             });
             // No WS_EX_LAYERED: it would block the system backdrop.
             let hwnd = CreateWindowExW(
@@ -267,7 +367,7 @@ impl PanelWindow {
             take_focus(hwnd, previous);
             // The tray menu leaves our hidden owner in front; nothing to give back to.
             let previous = if previous == owner { HWND::default() } else { previous };
-            Ok(Self { hwnd, previous, _shared: shared })
+            Ok(Self { hwnd, previous, shared })
         }
     }
 
@@ -275,12 +375,18 @@ impl PanelWindow {
         self.hwnd
     }
 
-    /// Schedules a repaint (drawn on the next `WM_PAINT`).
-    #[allow(dead_code)] // called once the panel shows live data
-    pub fn redraw(&mut self) {
-        unsafe {
-            let _ = InvalidateRect(Some(self.hwnd), None, false);
-        }
+    /// Shows `view` (drawn on the next `WM_PAINT`), resizing the window if its
+    /// layout changed size. The panel keeps its own `dpi` and `hover`.
+    pub fn redraw(&mut self, view: PanelView) {
+        self.shared.update(self.hwnd, move |current| {
+            let (dpi, hover) = (current.dpi, current.hover);
+            *current = PanelView { dpi, hover, ..view };
+        });
+    }
+
+    /// The click announced by the last `WM_PANEL_HIT`, once.
+    pub fn take_click(&self) -> Option<Hit> {
+        self.shared.click.take()
     }
 }
 
@@ -288,7 +394,7 @@ impl Drop for PanelWindow {
     fn drop(&mut self) {
         unsafe {
             // Detach first: closing must not post another WM_PANEL_CLOSED, and
-            // the window procedure must not touch `_shared` once it is freed.
+            // the window procedure must not touch `shared` once it is freed.
             SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
             // Give the focus back only if we still hold it: after a click
             // outside, the clicked window keeps it.
@@ -297,7 +403,7 @@ impl Drop for PanelWindow {
             }
             let _ = DestroyWindow(self.hwnd);
         }
-        // `_shared` (render target and factories) is released right after.
+        // `shared` (render target and factories) is released right after.
     }
 }
 

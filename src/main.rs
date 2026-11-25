@@ -1,11 +1,16 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod apps;
+mod config;
+mod media;
 mod model;
 mod panel;
 mod readers;
 mod render;
+mod speedtest;
 mod startup;
+mod sysinfo;
 mod taskbar;
 mod theme;
 mod tray;

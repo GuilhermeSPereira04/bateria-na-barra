@@ -28,7 +28,7 @@ pub struct Bitmap {
 }
 
 impl Bitmap {
-    fn new(width: i32, height: i32) -> Option<Self> {
+    pub(crate) fn new(width: i32, height: i32) -> Option<Self> {
         unsafe {
             let dc = CreateCompatibleDC(None);
             if dc.is_invalid() {
@@ -72,11 +72,11 @@ impl Drop for Bitmap {
     }
 }
 
-const TEXT_FONT: PCWSTR = windows::core::w!("Segoe UI Variable Text");
-const ICON_FONT: PCWSTR = windows::core::w!("Segoe Fluent Icons");
-const BOLT: char = '\u{E945}';
+pub(crate) const TEXT_FONT: PCWSTR = windows::core::w!("Segoe UI Variable Text");
+pub(crate) const ICON_FONT: PCWSTR = windows::core::w!("Segoe Fluent Icons");
+pub(crate) const BOLT: char = '\u{E945}';
 
-fn device_glyph(kind: DeviceKind) -> char {
+pub(crate) fn device_glyph(kind: DeviceKind) -> char {
     match kind {
         DeviceKind::Mouse => '\u{E962}',
         DeviceKind::Controller => '\u{E7FC}',
@@ -84,12 +84,25 @@ fn device_glyph(kind: DeviceKind) -> char {
     }
 }
 
-fn rgb(hex: u32, alpha: f32) -> D2D1_COLOR_F {
+pub(crate) fn rgb(hex: u32, alpha: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F {
         r: ((hex >> 16) & 0xFF) as f32 / 255.0,
         g: ((hex >> 8) & 0xFF) as f32 / 255.0,
         b: (hex & 0xFF) as f32 / 255.0,
         a: alpha,
+    }
+}
+
+/// Text, color and charging bolt of one visible item, by the strip's rules
+/// (low battery in red, `--%` dimmed). Shared with the panel.
+pub(crate) fn item_style(view: &ItemView, dark: bool) -> (String, D2D1_COLOR_F, bool) {
+    let (base, low) = if dark { (0xFFFFFF, 0xFF6B5E) } else { (0x1A1A1A, 0xC42B1C) };
+    match view {
+        ItemView::Value(r) => {
+            let hex = if is_low(r) { low } else { base };
+            (format!("{}%", r.percent), rgb(hex, 1.0), r.charge == Charge::Charging)
+        }
+        _ => ("--%".to_string(), rgb(base, 0.55), false),
     }
 }
 
@@ -182,8 +195,6 @@ impl Renderer {
         let h = height_px as f32;
         let text_fmt = self.format(TEXT_FONT, DWRITE_FONT_WEIGHT_SEMI_BOLD, 14.0 * scale).ok()?;
         let icon_fmt = self.format(ICON_FONT, DWRITE_FONT_WEIGHT_NORMAL, 14.0 * scale).ok()?;
-        let (base, low) = if strip.dark { (0xFFFFFF, 0xFF6B5E) } else { (0x1A1A1A, 0xC42B1C) };
-
         let pad = 4.0 * scale;
         let mut x = pad;
         let mut runs = Vec::new();
@@ -191,13 +202,7 @@ impl Renderer {
             if i > 0 {
                 x += 14.0 * scale;
             }
-            let (text, color, charging) = match view {
-                ItemView::Value(r) => {
-                    let hex = if is_low(r) { low } else { base };
-                    (format!("{}%", r.percent), rgb(hex, 1.0), r.charge == Charge::Charging)
-                }
-                _ => ("--%".to_string(), rgb(base, 0.55), false),
-            };
+            let (text, color, charging) = item_style(view, strip.dark);
             let icon = self.run(&device_glyph(*kind).to_string(), &icon_fmt, h, x, color).ok()?;
             x += icon.width + 4.0 * scale;
             runs.push(icon);
