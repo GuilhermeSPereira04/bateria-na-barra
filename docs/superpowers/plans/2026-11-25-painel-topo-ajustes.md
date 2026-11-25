@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Repositório `D:\dev\battery-bar`, branch `feat/painel-topo`. Em bash, cargo precisa de `export PATH=/d/mingw64/bin:$PATH` pra linkar.
-- Memória (coluna "Memória" do Gerenciador = contador `\Process(battery-bar)\Working Set - Private`): o usuário pediu **o menor consumo razoável**. Teto: fechado ≤ ~8 MB (inclusive depois de abrir/fechar) e aberto ≤ ~20 MB. **Alvo:** fechado ≤ ~6 MB e aberto ≤ ~15 MB.
+- Memória (coluna "Memória" do Gerenciador = contador `\Process(battery-bar)\Working Set - Private`): painel fechado ≤ ~8 MB, inclusive depois de abrir/fechar; aberto ≤ ~20 MB.
 - O vidro tem que continuar **transparente com desfoque** depois de qualquer mudança no jeito de desenhar. Fundo preto ou opaco é falha.
 - **Pode** rodar `target\release\battery-bar.exe` (o usuário autorizou): feche antes a instância dele (`Stop-Process -Name battery-bar`). **Nunca** mova o mouse nem digite. Pra abrir/fechar o painel use `--painel abrir|fechar` (Task 1). Prints da tela com PowerShell `CopyFromScreen` são permitidos. Ao terminar cada task, **deixe `target\release\battery-bar.exe` rodando**.
 - Nunca ligue/desligue rádios, mude o áudio, mande comando de mídia nem rode o speed test.
@@ -67,7 +67,6 @@
 - [ ] **Step 1:** Escrever o script e medir a versão atual. Anotar os 3 números no relatório. Referência: o usuário viu 70 MB aberto.
 - [ ] **Step 2:** Descobrir o que pesa. Hipótese principal: `create_target` em `panel/mod.rs:216` usa `D2D1_RENDER_TARGET_TYPE_DEFAULT` (hardware → D3D + driver da GPU). Teste a hipótese trocando só isso e medindo de novo. Mostre os números de antes e depois.
 - [ ] **Step 3:** Aplicar a correção que fizer o painel aberto ficar ≤ ~20 MB e o fechado ≤ ~8 MB, **mantendo o vidro transparente** (Global Constraints). Atenção: um render target de software numa HWND apresenta via GDI e pode perder o alpha, deixando o fundo preto. Se isso acontecer, use outro caminho, por exemplo um DIB premultiplicado de 32 bpp desenhado com `ID2D1DCRenderTarget` e apresentado de forma que o DWM respeite o alpha, ou D3D11 WARP + DirectComposition. Confirme com um print sobre o papel de parede. Os 136 testes continuam passando.
-- [ ] **Step 3b: Cortar o resto, rumo ao alvo.** Ao fechar o painel, soltar o que só serve aberto: render target, brushes, text formats, o cache de ícones e a lista de apps. Ao abrir, recriar (a lista de apps vem do worker). Ao fechar, também chamar `SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX)` pra devolver as páginas ao Windows. Medir cada corte e manter só os que derem ganho medido sem deixar a abertura lenta, ou seja, o painel continua aparecendo em até ~150 ms depois do `--painel abrir` (meça o tempo).
 - [ ] **Step 4:** Rodar `tools/medir-memoria.ps1` e colocar os números no relatório e na mensagem do commit.
 - [ ] **Step 5:** Commit `fix: keep the open panel light (<20 MB)`, com os números no corpo da mensagem.
 
