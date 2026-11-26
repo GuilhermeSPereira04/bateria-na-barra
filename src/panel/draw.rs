@@ -4,9 +4,9 @@ use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::core::PCWSTR;
-use windows_numerics::Vector2;
+use windows_numerics::{Matrix3x2, Vector2};
 
-use super::layout::{INSET, Layout, MAX_OUTPUTS, MAX_ROWS, ROW_H, SLIDER_LABEL_W, scale};
+use super::layout::{INSET, Layout, MAX_OUTPUTS, MAX_ROWS, ROW_H, SLIDER_LABEL_W, TABS_PAD, scale};
 use super::view::{AudioMenu, Hit, PanelView, SliderKind, Tab, Toggle};
 use crate::apps::AppEntry;
 use crate::config::{ACCENTS, Accent, Colors, GlassTint};
@@ -15,20 +15,24 @@ use crate::model::ItemView;
 use crate::render::{BOLT, ICON_FONT, TEXT_FONT, device_glyph, item_style, rgb};
 use crate::speedtest::{Phase, SpeedState};
 
-const CARD: f32 = 0.07; // white over the dark glass
+const CARD: f32 = 0.08; // white over the dark glass
 const HOVER: f32 = 0.06;
 const SELECTED: f32 = 0.10;
-const RADIUS: f32 = 8.0;
+/// Corner radius of the big cards, in DIP.
+const CARD_RADIUS: f32 = 20.0;
+/// Knob and groove of the bars, in DIP.
+const KNOB: f32 = 8.0;
+const GROOVE: f32 = 6.0;
 /// Result icons, in DIP.
 const ICON: f32 = 20.0;
 /// The media cover and its distance from the card's left edge, in DIP.
-const COVER: f32 = 32.0;
-const COVER_INSET: f32 = 6.0;
+const COVER: f32 = 48.0;
+const COVER_INSET: f32 = 12.0;
 const TEXT: u32 = 0xFFFFFF;
 const TEXT_ON_LIGHT: u32 = 0x1B1B1B;
 const ERROR: u32 = 0xFF6B5E;
-/// Text over an accent fill (accents are light colors).
-const ON_ACCENT: u32 = 0x0E1A12;
+/// Text over a light accent fill (the default blue takes white).
+const ON_LIGHT_ACCENT: u32 = 0x0E1A12;
 const UNAVAILABLE: f32 = 0.45;
 const ACCENT_WINDOWS: &str = "Usar a cor do Windows";
 
@@ -44,6 +48,9 @@ const GLYPH_PAUSE: char = '\u{E769}';
 const GLYPH_NEXT: char = '\u{E893}';
 const GLYPH_LEFT: char = '\u{E76B}';
 const GLYPH_RIGHT: char = '\u{E76C}';
+const GLYPH_SPEAKER: char = '\u{E7F5}';
+const GLYPH_HEADPHONE: char = '\u{E7F6}';
+const GLYPH_SCREEN: char = '\u{E7F4}';
 
 const MONTHS: [&str; 12] =
     ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"];
@@ -54,6 +61,8 @@ pub struct Cache {
     dpi: u32,
     fonts: Option<Fonts>,
     brush: Option<ID2D1SolidColorBrush>,
+    /// Vertical gradient of the light edge on cards and pills.
+    edge: Option<ID2D1LinearGradientBrush>,
     /// Bitmaps of the results' icons, by app id.
     icons: Vec<(String, ID2D1Bitmap)>,
     /// The media cover's bitmap and the pixels it was made from.
@@ -67,16 +76,19 @@ struct Fonts {
     battery: IDWriteTextFormat,
     icon: IDWriteTextFormat,
     icon_big: IDWriteTextFormat,
+    icon_xl: IDWriteTextFormat,
+    title: IDWriteTextFormat,
 }
 
 impl Cache {
     pub fn new() -> Self {
-        Self { dpi: 0, fonts: None, brush: None, icons: Vec::new(), cover: None }
+        Self { dpi: 0, fonts: None, brush: None, edge: None, icons: Vec::new(), cover: None }
     }
 
     /// Forgets what belongs to a render target that is being replaced.
     pub fn reset_target(&mut self) {
         self.brush = None;
+        self.edge = None;
         self.icons.clear();
         self.cover = None;
     }
@@ -141,6 +153,8 @@ impl Fonts {
             battery: format(dw, TEXT_FONT, DWRITE_FONT_WEIGHT_SEMI_BOLD, 14.0 * s)?,
             icon: format(dw, ICON_FONT, DWRITE_FONT_WEIGHT_NORMAL, 14.0 * s)?,
             icon_big: format(dw, ICON_FONT, DWRITE_FONT_WEIGHT_NORMAL, 16.0 * s)?,
+            icon_xl: format(dw, ICON_FONT, DWRITE_FONT_WEIGHT_NORMAL, 22.0 * s)?,
+            title: format(dw, TEXT_FONT, DWRITE_FONT_WEIGHT_SEMI_BOLD, 15.0 * s)?,
         })
     }
 }
@@ -157,6 +171,7 @@ struct Painter<'a> {
     rt: &'a ID2D1RenderTarget,
     dw: &'a IDWriteFactory,
     brush: &'a ID2D1SolidColorBrush,
+    edge: &'a ID2D1LinearGradientBrush,
     f: &'a Fonts,
     s: f32,
     icons: &'a [(String, ID2D1Bitmap)],
@@ -165,6 +180,17 @@ struct Painter<'a> {
 
 fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
     D2D_RECT_F { left, top, right, bottom }
+}
+
+/// Radius that rounds the ends of `r` completely.
+fn pill_radius(r: D2D_RECT_F) -> f32 {
+    ((r.right - r.left).min(r.bottom - r.top)) / 2.0
+}
+
+/// Text color over an accent fill: white, unless the accent is a light color.
+fn on_accent(accent: u32) -> u32 {
+    let (r, g, b) = (((accent >> 16) & 0xFF) as f32, ((accent >> 8) & 0xFF) as f32, (accent & 0xFF) as f32);
+    if (0.299 * r + 0.587 * g + 0.114 * b) / 255.0 > 0.6 { ON_LIGHT_ACCENT } else { TEXT }
 }
 
 thread_local! {
@@ -189,10 +215,61 @@ impl Painter<'_> {
         unsafe { self.brush.SetColor(&c) };
     }
 
-    fn fill(&self, r: D2D_RECT_F, c: D2D1_COLOR_F) {
+    /// Rounded rectangle with corner radius `radius` (pixels).
+    fn round(&self, r: D2D_RECT_F, radius: f32, c: D2D1_COLOR_F) {
         self.color(c);
-        let radius = self.px(RADIUS);
         unsafe { self.rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: radius, radiusY: radius }, self.brush) };
+    }
+
+    /// Fully round ends (a circle when the rectangle is square).
+    fn pill(&self, r: D2D_RECT_F, c: D2D1_COLOR_F) {
+        self.round(r, pill_radius(r), c);
+    }
+
+    /// The soft shadow around a shape: two faint rings just outside it.
+    fn shadow(&self, r: D2D_RECT_F, radius: f32) {
+        for (grow, dy, alpha) in [(1.0, 1.0, 0.10), (2.0, 2.0, 0.05)] {
+            let (g, dy) = (self.px(grow), self.px(dy));
+            let rr = D2D1_ROUNDED_RECT {
+                rect: rect(r.left - g, r.top - g + dy, r.right + g, r.bottom + g + dy),
+                radiusX: radius + g,
+                radiusY: radius + g,
+            };
+            self.color(rgb(0, alpha));
+            unsafe { self.rt.DrawRoundedRectangle(&rr, self.brush, g * 2.0, None) };
+        }
+    }
+
+    /// The 1 px light edge: bright at the top, fading toward the bottom.
+    fn edge(&self, r: D2D_RECT_F, radius: f32) {
+        let half = self.px(0.5);
+        let rr = D2D1_ROUNDED_RECT { rect: rect(r.left + half, r.top + half, r.right - half, r.bottom - half), radiusX: radius, radiusY: radius };
+        unsafe {
+            self.edge.SetStartPoint(Vector2 { X: 0.0, Y: r.top });
+            self.edge.SetEndPoint(Vector2 { X: 0.0, Y: r.bottom });
+            self.rt.DrawRoundedRectangle(&rr, self.edge, self.px(1.0), None);
+        }
+    }
+
+    /// A big card: shadow, fill and light edge.
+    fn card(&self, r: D2D_RECT_F, c: D2D1_COLOR_F) {
+        let radius = self.px(CARD_RADIUS);
+        self.shadow(r, radius);
+        self.round(r, radius, c);
+        self.edge(r, radius);
+    }
+
+    /// A pill or circle with shadow and light edge.
+    fn pill_card(&self, r: D2D_RECT_F, c: D2D1_COLOR_F) {
+        let radius = pill_radius(r);
+        self.shadow(r, radius);
+        self.round(r, radius, c);
+        self.edge(r, radius);
+    }
+
+    /// Hover highlight: round, at most a card's radius.
+    fn hover(&self, r: D2D_RECT_F) {
+        self.round(r, pill_radius(r).min(self.px(CARD_RADIUS)), white(HOVER));
     }
 
     fn circle(&self, cx: f32, cy: f32, radius: f32, c: D2D1_COLOR_F, stroke: Option<f32>) {
@@ -253,9 +330,12 @@ pub fn draw(rt: &ID2D1RenderTarget, dw: &IDWriteFactory, cache: &mut Cache, view
     let shown: &[AppEntry] = if view.query.is_empty() { &[] } else { &view.results };
     cache.sync_icons(rt, shown);
     cache.sync_cover(rt, view.media.as_ref().and_then(|m| m.cover.as_ref()));
-    let (Some(f), Some(brush)) = (&cache.fonts, &cache.brush) else { return Ok(()) };
+    if cache.edge.is_none() {
+        cache.edge = Some(edge_brush(rt)?);
+    }
+    let (Some(f), Some(brush), Some(edge)) = (&cache.fonts, &cache.brush, &cache.edge) else { return Ok(()) };
     let cover = cache.cover.as_ref().map(|(_, bmp)| bmp);
-    let p = Painter { rt, dw, brush, f, s, icons: &cache.icons, cover };
+    let p = Painter { rt, dw, brush, edge, f, s, icons: &cache.icons, cover };
     // ClearType can't blend onto transparent pixels.
     unsafe { rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE) };
 
@@ -281,23 +361,40 @@ pub fn draw(rt: &ID2D1RenderTarget, dw: &IDWriteFactory, cache: &mut Cache, view
     }
 
     if let Some(r) = view.hover.filter(|h| !matches!(h, Hit::Slider(_) | Hit::Blank | Hit::AudioDevice(_))).and_then(|h| layout.rect(h)) {
-        p.fill(r, white(HOVER));
+        p.hover(r);
+    }
+    // Opening / closing animation: black over everything while the shape is a pill.
+    if view.veil > 0.0 {
+        p.color(rgb(0, view.veil));
+        unsafe { rt.FillRectangle(&rect(0.0, 0.0, layout.size.0, layout.size.1), brush) };
     }
     Ok(())
 }
 
+fn edge_brush(rt: &ID2D1RenderTarget) -> windows::core::Result<ID2D1LinearGradientBrush> {
+    let stops = [
+        D2D1_GRADIENT_STOP { position: 0.0, color: rgb(0xFFFFFF, 0.22) },
+        D2D1_GRADIENT_STOP { position: 1.0, color: rgb(0xFFFFFF, 0.03) },
+    ];
+    unsafe {
+        let stops = rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)?;
+        let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: Vector2 { X: 0.0, Y: 0.0 }, endPoint: Vector2 { X: 0.0, Y: 1.0 } };
+        rt.CreateLinearGradientBrush(&props, None, &stops)
+    }
+}
+
 fn search(p: &Painter, view: &PanelView, l: &Layout) {
     let r = l.search;
-    p.fill(r, white(CARD));
-    p.glyph(GLYPH_SEARCH, &p.f.icon, rect(r.left + p.px(8.0), r.top, r.left + p.px(32.0), r.bottom), white(0.6));
-    let text = rect(r.left + p.px(38.0), r.top, r.right - p.px(12.0), r.bottom);
+    p.pill_card(r, white(CARD));
+    p.glyph(GLYPH_SEARCH, &p.f.icon, rect(r.left + p.px(14.0), r.top, r.left + p.px(38.0), r.bottom), white(0.6));
+    let text = rect(r.left + p.px(44.0), r.top, r.right - p.px(16.0), r.bottom);
     if view.query.is_empty() {
         p.text("Pesquisar apps…", &p.f.text, text, Align::Left, white(0.6));
     } else {
         p.text(&view.query, &p.f.text, text, Align::Left, white(0.92));
     }
     if let Some(g) = l.rect(Hit::Gear) {
-        p.fill(g, white(if view.gear_open { 0.14 } else { CARD }));
+        p.pill_card(g, white(if view.gear_open { 0.16 } else { CARD }));
         p.glyph(GLYPH_GEAR, &p.f.icon_big, g, white(0.85));
     }
 }
@@ -313,10 +410,10 @@ fn colors_row(p: &Painter, colors: &Colors, l: &Layout) {
     }
     if let Some(r) = l.rect(Hit::AccentWindows) {
         if colors.accent_choice == Accent::Windows {
-            p.fill(r, rgb(colors.accent, 1.0));
-            p.text(ACCENT_WINDOWS, &p.f.bold, r, Align::Center, rgb(ON_ACCENT, 0.9));
+            p.pill(r, rgb(colors.accent, 1.0));
+            p.text(ACCENT_WINDOWS, &p.f.bold, r, Align::Center, rgb(on_accent(colors.accent), 0.95));
         } else {
-            p.fill(r, white(CARD));
+            p.pill_card(r, white(CARD));
             p.text(ACCENT_WINDOWS, &p.f.text, r, Align::Center, white(0.92));
         }
     }
@@ -331,10 +428,10 @@ fn colors_row(p: &Painter, colors: &Colors, l: &Layout) {
     for (i, name) in ["Escuro", "Claro", "Destaque"].into_iter().enumerate() {
         let Some(r) = l.rect(Hit::Tint(i)) else { continue };
         if selected == Some(i) {
-            p.fill(r, rgb(colors.accent, 1.0));
-            p.text(name, &p.f.bold, r, Align::Center, rgb(ON_ACCENT, 0.9));
+            p.pill(r, rgb(colors.accent, 1.0));
+            p.text(name, &p.f.bold, r, Align::Center, rgb(on_accent(colors.accent), 0.95));
         } else {
-            p.fill(r, white(CARD));
+            p.pill_card(r, white(CARD));
             p.text(name, &p.f.text, r, Align::Center, white(0.92));
         }
     }
@@ -343,7 +440,7 @@ fn colors_row(p: &Painter, colors: &Colors, l: &Layout) {
 /// A bar: groove, the filled part in the accent color and the knob.
 fn slider(p: &Painter, track: D2D_RECT_F, value: u8, accent: u32) {
     let cy = (track.top + track.bottom) / 2.0;
-    let half = p.px(2.0);
+    let half = p.px(GROOVE / 2.0);
     let x = track.left + (track.right - track.left) * f32::from(value.min(100)) / 100.0;
     let groove = |right: f32, c: D2D1_COLOR_F| {
         p.color(c);
@@ -354,7 +451,8 @@ fn slider(p: &Painter, track: D2D_RECT_F, value: u8, accent: u32) {
     if x > track.left {
         groove(x, rgb(accent, 1.0));
     }
-    p.circle(x, cy, p.px(7.0), white(0.95), None);
+    p.circle(x, cy + p.px(1.0), p.px(KNOB), rgb(0, 0.28), None);
+    p.circle(x, cy, p.px(KNOB), rgb(TEXT, 1.0), None);
 }
 
 fn quick(p: &Painter, view: &PanelView, l: &Layout) {
@@ -385,27 +483,27 @@ fn quick(p: &Painter, view: &PanelView, l: &Layout) {
         let card = rect(m.left, m.top, a.right, m.bottom);
         let (fg, sub) = match state {
             Toggle::On => {
-                p.fill(card, rgb(view.colors.accent, 1.0));
-                (rgb(ON_ACCENT, 0.9), sub)
+                p.pill_card(card, rgb(view.colors.accent, 1.0));
+                (rgb(on_accent(view.colors.accent), 0.95), sub)
             }
             Toggle::Off => {
-                p.fill(card, white(CARD));
+                p.pill_card(card, white(CARD));
                 (white(0.92), sub)
             }
             Toggle::Unavailable => {
-                p.fill(card, white(CARD));
+                p.pill_card(card, white(CARD));
                 (white(UNAVAILABLE), "Indisponível".to_string())
             }
         };
         let mid = (m.top + m.bottom) / 2.0;
-        let mut x = m.left + p.px(12.0);
+        let mut x = m.left + p.px(20.0);
         if let Some(g) = glyph {
             p.glyph(g, &p.f.icon, rect(x, m.top + p.px(8.0), x + p.px(16.0), mid + p.px(2.0)), fg);
             x += p.px(20.0);
         }
         p.text(&title, &p.f.bold, rect(x, m.top + p.px(8.0), m.right - p.px(4.0), mid + p.px(2.0)), Align::Left, fg);
         let sub_color = D2D1_COLOR_F { a: fg.a * 0.8, ..fg };
-        p.text(&sub, &p.f.small, rect(m.left + p.px(12.0), mid, m.right - p.px(4.0), m.bottom - p.px(8.0)), Align::Left, sub_color);
+        p.text(&sub, &p.f.small, rect(m.left + p.px(20.0), mid, m.right - p.px(4.0), m.bottom - p.px(8.0)), Align::Left, sub_color);
         let divider = D2D1_COLOR_F { a: 0.25, ..fg };
         p.line((a.left, a.top + p.px(14.0)), (a.left, a.bottom - p.px(14.0)), p.px(1.0), divider);
         p.glyph(GLYPH_MORE, &p.f.icon, a, fg);
@@ -414,13 +512,13 @@ fn quick(p: &Painter, view: &PanelView, l: &Layout) {
 
 fn battery(p: &Painter, view: &PanelView, l: &Layout) {
     let r = l.battery;
-    p.fill(r, white(CARD));
+    p.pill_card(r, white(CARD));
     let visible: Vec<_> = view.battery.iter().filter(|(_, v)| *v != ItemView::Hidden).collect();
     if visible.is_empty() {
-        p.text("Nenhum aparelho", &p.f.text, rect(r.left + p.px(14.0), r.top, r.right, r.bottom), Align::Left, white(0.55));
+        p.text("Nenhum aparelho", &p.f.text, rect(r.left + p.px(20.0), r.top, r.right, r.bottom), Align::Left, white(0.55));
         return;
     }
-    let mut x = r.left + p.px(14.0);
+    let mut x = r.left + p.px(20.0);
     for (i, (kind, item)) in visible.into_iter().enumerate() {
         if i > 0 {
             x += p.px(14.0);
@@ -445,34 +543,47 @@ fn battery(p: &Painter, view: &PanelView, l: &Layout) {
 
 fn media(p: &Painter, view: &PanelView, l: &Layout) {
     let r = l.media;
-    p.fill(r, white(CARD));
+    p.card(r, white(CARD));
     let end = l.rect(Hit::MediaPrev).map_or(r.right, |b| b.left) - p.px(8.0);
-    let mut left = r.left + p.px(12.0);
+    let mid = (r.top + r.bottom) / 2.0;
+    let mut left = r.left + p.px(20.0);
     if let (Some(bmp), Some(_)) = (p.cover, &view.media) {
         let (size, x) = (p.px(COVER), r.left + p.px(COVER_INSET));
-        let y = (r.top + r.bottom - size) / 2.0;
-        let dest = rect(x, y, x + size, y + size);
-        unsafe { p.rt.DrawBitmap(bmp, Some(&dest), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None) };
-        left = dest.right + p.px(10.0);
+        let y = mid - size / 2.0;
+        // The cover is painted through a bitmap brush so its corners can be round.
+        let k = size / COVER_PX as f32;
+        let bitmap_props = D2D1_BITMAP_BRUSH_PROPERTIES {
+            extendModeX: D2D1_EXTEND_MODE_CLAMP,
+            extendModeY: D2D1_EXTEND_MODE_CLAMP,
+            interpolationMode: D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+        };
+        let brush_props = D2D1_BRUSH_PROPERTIES { opacity: 1.0, transform: Matrix3x2 { M11: k, M12: 0.0, M21: 0.0, M22: k, M31: x, M32: y } };
+        if let Ok(cover) = unsafe { p.rt.CreateBitmapBrush(bmp, Some(&bitmap_props), Some(&brush_props)) } {
+            let radius = p.px(10.0);
+            let rr = D2D1_ROUNDED_RECT { rect: rect(x, y, x + size, y + size), radiusX: radius, radiusY: radius };
+            unsafe { p.rt.FillRoundedRectangle(&rr, &cover) };
+        }
+        left = x + size + p.px(12.0);
     }
-    let (playing, alpha) = match &view.media {
+    let playing = match &view.media {
         Some(np) => {
-            let w = p.measure(&np.title, &p.f.bold).min(end - left);
-            p.text(&np.title, &p.f.bold, rect(left, r.top, left + w, r.bottom), Align::Left, white(0.92));
-            if !np.artist.is_empty() {
-                let artist = format!(" · {}", np.artist);
-                p.text(&artist, &p.f.text, rect(left + w, r.top, end, r.bottom), Align::Left, white(0.6));
+            if np.artist.is_empty() {
+                p.text(&np.title, &p.f.title, rect(left, r.top, end, r.bottom), Align::Left, white(0.96));
+            } else {
+                p.text(&np.title, &p.f.title, rect(left, r.top + p.px(12.0), end, mid), Align::Left, white(0.96));
+                p.text(&np.artist, &p.f.text, rect(left, mid, end, r.bottom - p.px(12.0)), Align::Left, white(0.6));
             }
-            (np.playing, 0.85)
+            np.playing
         }
         None => {
             p.text("Nada tocando", &p.f.text, rect(left, r.top, end, r.bottom), Align::Left, white(0.55));
-            (false, UNAVAILABLE)
+            false
         }
     };
+    let alpha = if view.media.is_some() { 0.95 } else { UNAVAILABLE };
     for (hit, g) in [(Hit::MediaPrev, GLYPH_PREV), (Hit::MediaPlay, play_glyph(playing)), (Hit::MediaNext, GLYPH_NEXT)] {
         if let Some(b) = l.rect(hit) {
-            p.glyph(g, &p.f.icon, b, white(alpha));
+            p.glyph(g, &p.f.icon_xl, b, white(alpha));
         }
     }
 }
@@ -483,7 +594,7 @@ fn play_glyph(playing: bool) -> char {
 }
 
 fn lower(p: &Painter, view: &PanelView, l: &Layout) {
-    p.fill(l.body, white(CARD));
+    p.card(l.body, white(CARD));
     if !view.query.is_empty() {
         let items: Vec<(&str, Option<&ID2D1Bitmap>)> = view
             .results
@@ -493,14 +604,16 @@ fn lower(p: &Painter, view: &PanelView, l: &Layout) {
         rows(p, l, &items, Hit::Result, Some(view.selected), "Nada encontrado");
         return;
     }
+    // Segmented control: one pill around the tabs, a lighter pill under the selected one.
+    if let (Some(first), Some(last)) = (l.rect(Hit::Tab(Tab::Resources)), l.rect(Hit::Tab(Tab::Speed))) {
+        let (dx, dy) = (p.px(TABS_PAD.0), p.px(TABS_PAD.1));
+        p.pill_card(rect(first.left - dx, first.top - dy, last.right + dx, first.bottom + dy), white(0.07));
+    }
     for (tab, name) in [(Tab::Resources, "Recursos"), (Tab::Calendar, "Calendário"), (Tab::Speed, "Speed test")] {
         let Some(r) = l.rect(Hit::Tab(tab)) else { continue };
         if tab == view.tab {
-            let accent = rgb(view.colors.accent, 1.0);
-            p.text(name, &p.f.bold, r, Align::Center, accent);
-            let cx = (r.left + r.right) / 2.0;
-            let y = r.bottom - p.px(1.0);
-            p.line((cx - p.px(10.0), y), (cx + p.px(10.0), y), p.px(2.0), accent);
+            p.pill(r, white(0.2));
+            p.text(name, &p.f.bold, r, Align::Center, white(1.0));
         } else {
             p.text(name, &p.f.text, r, Align::Center, white(0.6));
         }
@@ -517,34 +630,52 @@ fn audio_menu(p: &Painter, view: &PanelView, menu: &AudioMenu, l: &Layout) {
     let Some(card) = l.menu else { return };
     // Mostly opaque so it reads over whatever is below.
     let light = view.colors.tint_choice == GlassTint::Light;
-    p.color(if light { rgb(0xF3F3F3, 0.92) } else { rgb(0x20242C, 0.85) });
-    let radius = p.px(RADIUS);
-    unsafe { p.rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: card, radiusX: radius, radiusY: radius }, p.brush) };
-    p.fill(card, white(0.12));
+    let radius = p.px(CARD_RADIUS);
+    p.shadow(card, radius);
+    p.round(card, radius, if light { rgb(0xF3F3F3, 0.94) } else { rgb(0x20242C, 0.92) });
+    p.round(card, radius, white(0.08));
+    p.edge(card, radius);
     if let Some(track) = l.rect(Hit::Slider(SliderKind::Volume)) {
-        let icon = rect(card.left + p.px(INSET), track.top, track.left - p.px(4.0), track.bottom);
+        let icon = rect(card.left + p.px(INSET + 4.0), track.top, track.left - p.px(10.0), track.bottom);
         let glyph = if view.quick.audio == Toggle::Off { GLYPH_MUTE } else { GLYPH_VOLUME };
         p.glyph(glyph, &p.f.icon, icon, white(0.92));
         slider(p, track, menu.volume, view.colors.accent);
-        let value = rect(track.right + p.px(12.0), track.top, card.right - p.px(4.0), track.bottom);
+        let value = rect(track.right + p.px(14.0), track.top, card.right - p.px(4.0), track.bottom);
         p.text(&format!("{}%", menu.volume), &p.f.text, value, Align::Left, white(0.92));
     }
     if menu.outputs.is_empty() {
         let top = card.top + p.px(36.0);
-        p.text("Nenhuma saída de áudio", &p.f.text, rect(card.left + p.px(INSET), top, card.right, top + p.px(ROW_H)), Align::Left, white(0.55));
+        p.text("Nenhuma saída de áudio", &p.f.text, rect(card.left + p.px(INSET + 4.0), top, card.right, top + p.px(ROW_H)), Align::Left, white(0.55));
     }
     for (i, name) in menu.outputs.iter().take(MAX_OUTPUTS).enumerate() {
         let Some(r) = l.rect(Hit::AudioDevice(i)) else { continue };
-        if view.hover == Some(Hit::AudioDevice(i)) {
-            p.fill(r, white(HOVER));
-        }
         let current = menu.current == Some(i);
+        let inset = p.px(6.0);
+        if view.hover == Some(Hit::AudioDevice(i)) {
+            p.pill(rect(r.left + inset, r.top + p.px(1.0), r.right - inset, r.bottom - p.px(1.0)), white(HOVER));
+        }
+        let color = if current { rgb(view.colors.accent, 1.0) } else { white(0.7) };
+        let icon = rect(r.left + p.px(INSET + 4.0), r.top, r.left + p.px(INSET + 24.0), r.bottom);
+        p.glyph(output_glyph(name), &p.f.icon, icon, color);
+        let text = rect(r.left + p.px(INSET + 32.0), r.top, r.right - p.px(INSET + 28.0), r.bottom);
+        p.text(name, &p.f.text, text, Align::Left, white(if current { 1.0 } else { 0.85 }));
         if current {
-            let check = rect(r.left + p.px(INSET - 2.0), r.top, r.left + p.px(INSET + 18.0), r.bottom);
+            let check = rect(r.right - p.px(INSET + 24.0), r.top, r.right - p.px(INSET + 4.0), r.bottom);
             p.glyph(GLYPH_CHECK, &p.f.icon, check, rgb(view.colors.accent, 1.0));
         }
-        let text = rect(r.left + p.px(INSET + 22.0), r.top, r.right - p.px(INSET), r.bottom);
-        p.text(name, &p.f.text, text, Align::Left, white(if current { 1.0 } else { 0.85 }));
+    }
+}
+
+/// An icon for an output device, guessed from its name.
+fn output_glyph(name: &str) -> char {
+    let n = name.to_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| n.contains(w));
+    if has(&["fone", "headphone", "headset", "airpods", "buds"]) {
+        GLYPH_HEADPHONE
+    } else if has(&["hdmi", "displayport", "monitor", "tv", "display"]) {
+        GLYPH_SCREEN
+    } else {
+        GLYPH_SPEAKER
     }
 }
 
@@ -559,7 +690,7 @@ fn rows(p: &Painter, l: &Layout, items: &[(&str, Option<&ID2D1Bitmap>)], hit: fn
     for (i, (name, icon)) in items.iter().take(MAX_ROWS).enumerate() {
         let Some(r) = l.rect(hit(i)) else { continue };
         if selected == Some(i) {
-            p.fill(r, white(SELECTED));
+            p.pill(rect(r.left + p.px(6.0), r.top + p.px(1.0), r.right - p.px(6.0), r.bottom - p.px(1.0)), white(SELECTED));
         }
         let mut left = r.left + p.px(INSET);
         if let Some(bmp) = icon {
@@ -608,9 +739,9 @@ fn resources(p: &Painter, view: &PanelView, l: &Layout) {
         p.text(name, &p.f.bold, line, Align::Left, white(0.92));
         p.text(&value.unwrap_or_else(|| "…".into()), &p.f.text, line, Align::Right, white(0.8));
         let bar_top = top + p.px(28.0);
-        let track = rect(left, bar_top, right, bar_top + p.px(6.0));
-        p.color(white(0.10));
-        let round = |r: D2D_RECT_F| D2D1_ROUNDED_RECT { rect: r, radiusX: p.px(3.0), radiusY: p.px(3.0) };
+        let track = rect(left, bar_top, right, bar_top + p.px(10.0));
+        p.color(white(0.12));
+        let round = |r: D2D_RECT_F| D2D1_ROUNDED_RECT { rect: r, radiusX: p.px(5.0), radiusY: p.px(5.0) };
         unsafe { p.rt.FillRoundedRectangle(&round(track), p.brush) };
         if let Some(fr) = frac {
             let w = (right - left) * fr.clamp(0.0, 1.0);
@@ -687,11 +818,11 @@ fn speed(p: &Painter, view: &PanelView, l: &Layout) {
     let Some(btn) = l.rect(Hit::SpeedStart) else { return };
     let running = matches!(view.speed, SpeedState::Running { .. });
     if running {
-        p.fill(btn, white(CARD));
+        p.pill_card(btn, white(CARD));
         p.text("Testando…", &p.f.bold, btn, Align::Center, white(UNAVAILABLE));
     } else {
-        p.fill(btn, rgb(view.colors.accent, 1.0));
-        p.text("Testar", &p.f.bold, btn, Align::Center, rgb(ON_ACCENT, 0.9));
+        p.pill(btn, rgb(view.colors.accent, 1.0));
+        p.text("Testar", &p.f.bold, btn, Align::Center, rgb(on_accent(view.colors.accent), 0.95));
     }
     let mbps = |v: f32| format!("{} Mb/s", decimal(v));
     let opt = |v: Option<String>| v.unwrap_or_else(|| "…".into());
@@ -905,6 +1036,20 @@ mod tests {
             let room = r.right - r.left - 2.0 * 8.0 * scale(dpi);
             assert!(m.width <= room, "dpi {dpi}: text {} > room {room}", m.width);
         }
+    }
+
+    #[test]
+    fn text_on_accent_follows_luminance() {
+        assert_eq!(on_accent(0x0A84FF), 0xFFFFFF); // default blue
+        assert_eq!(on_accent(0xE6E6E6), ON_LIGHT_ACCENT);
+        assert_eq!(on_accent(0xF5E07A), ON_LIGHT_ACCENT);
+    }
+
+    #[test]
+    fn output_icons_by_name() {
+        assert_eq!(output_glyph("Fones de ouvido (Realtek)"), GLYPH_HEADPHONE);
+        assert_eq!(output_glyph("LG TV (HDMI)"), GLYPH_SCREEN);
+        assert_eq!(output_glyph("Alto-falantes"), GLYPH_SPEAKER);
     }
 
     #[test]

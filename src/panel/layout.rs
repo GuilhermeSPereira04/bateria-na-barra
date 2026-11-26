@@ -23,16 +23,19 @@ pub struct Layout {
 const WIDTH: f32 = 760.0;
 const PAD: f32 = 16.0;
 const GAP: f32 = 8.0;
-const SEARCH_H: f32 = 36.0;
+const SEARCH_H: f32 = 40.0;
 /// The gear's color row; with the gap below it the panel grows by 40.
 const COLOR_ROW_H: f32 = 32.0;
 const QUICK_H: f32 = 52.0;
 const TOGGLE_W: f32 = 120.0;
 /// The "more" arrow at the right end of each quick toggle.
 const ARROW_W: f32 = 28.0;
-const MEDIA_H: f32 = 44.0;
-const MEDIA_BTN: f32 = 36.0;
-const TABS_H: f32 = 28.0;
+/// The player card: cover (48) plus room around it.
+const MEDIA_H: f32 = 72.0;
+const MEDIA_BTN: f32 = 44.0;
+const TABS_H: f32 = 34.0;
+/// Space around the tabs inside their segmented control.
+pub const TABS_PAD: (f32, f32) = (4.0, 3.0);
 const TAB_W: f32 = 96.0;
 const BODY_H: f32 = 220.0;
 /// Transparency row: the label's width and the bar's.
@@ -41,17 +44,19 @@ const SLIDER_W: f32 = 360.0;
 /// Fits "Usar a cor do Windows" with room on both sides; the gear row then
 /// takes 716 of the 728 DIP available.
 const ACCENT_WINDOWS_W: f32 = 172.0;
+/// One preset swatch (nine of them fit with the rest of the row).
+const ACCENT_W: f32 = 28.0;
 /// Height of a row in the results / output list.
 pub const ROW_H: f32 = 30.0;
 pub const MAX_ROWS: usize = 8;
 /// Most outputs the audio drop-down lists.
 pub const MAX_OUTPUTS: usize = 8;
-const MENU_W: f32 = 240.0;
+const MENU_W: f32 = 280.0;
 /// The drop-down's first row: the volume bar.
 const MENU_BAR_H: f32 = 36.0;
 /// Where the bar starts and how wide it is inside the first row (icon before, value after).
-pub const MENU_BAR_X: f32 = 40.0;
-const MENU_BAR_W: f32 = 144.0;
+pub const MENU_BAR_X: f32 = 48.0;
+const MENU_BAR_W: f32 = 176.0;
 /// Inner padding of the body card.
 pub const INSET: f32 = 12.0;
 
@@ -75,8 +80,8 @@ pub fn layout(view: &PanelView) -> Layout {
     if view.gear_open {
         let mut x = PAD;
         for i in 0..crate::config::ACCENTS.len() {
-            regions.push((r(x, y, 32.0, COLOR_ROW_H), Hit::Accent(i)));
-            x += 32.0;
+            regions.push((r(x, y, ACCENT_W, COLOR_ROW_H), Hit::Accent(i)));
+            x += ACCENT_W;
         }
         x += 16.0;
         regions.push((r(x, y, ACCENT_WINDOWS_W, COLOR_ROW_H), Hit::AccentWindows));
@@ -105,7 +110,7 @@ pub fn layout(view: &PanelView) -> Layout {
 
     let media = r(PAD, y, inner, MEDIA_H);
     let btn_y = y + (MEDIA_H - MEDIA_BTN) / 2.0;
-    let mut bx = WIDTH - PAD - 4.0 - 3.0 * MEDIA_BTN;
+    let mut bx = WIDTH - PAD - 8.0 - 3.0 * MEDIA_BTN;
     for hit in [Hit::MediaPrev, Hit::MediaPlay, Hit::MediaNext] {
         regions.push((r(bx, btn_y, MEDIA_BTN, MEDIA_BTN), hit));
         bx += MEDIA_BTN;
@@ -121,7 +126,10 @@ pub fn layout(view: &PanelView) -> Layout {
         (r(PAD, y, inner, 0.0), r(PAD, y, inner, lower_h))
     } else {
         for (i, tab) in [Tab::Resources, Tab::Calendar, Tab::Speed].into_iter().enumerate() {
-            regions.push((r(PAD + i as f32 * (TAB_W + 4.0), y, TAB_W, TABS_H), Hit::Tab(tab)));
+            regions.push((
+                r(PAD + TABS_PAD.0 + i as f32 * TAB_W, y + TABS_PAD.1, TAB_W, TABS_H - 2.0 * TABS_PAD.1),
+                Hit::Tab(tab),
+            ));
         }
         let by = y + TABS_H + GAP;
         let (left, right, top) = (PAD + INSET, WIDTH - PAD - INSET, by + INSET);
@@ -202,18 +210,18 @@ mod tests {
     #[test]
     fn layout_has_all_fixed_regions() {
         let l = layout(&at(96));
-        // Search box: y 16..52; quick row: y 60..112, Wi-Fi x 16..136 with its arrow at 108..136.
-        assert_eq!(hit_test(&l, 300.0, 34.0), Some(Hit::Search));
-        assert_eq!(hit_test(&l, 62.0, 86.0), Some(Hit::Wifi));
-        assert_eq!(hit_test(&l, 122.0, 86.0), Some(Hit::WifiMore));
-        assert_eq!(hit_test(&l, 726.0, 34.0), Some(Hit::Gear));
+        // Search box: y 16..56; quick row: y 64..116, Wi-Fi x 16..136 with its arrow at 108..136.
+        assert_eq!(hit_test(&l, 300.0, 36.0), Some(Hit::Search));
+        assert_eq!(hit_test(&l, 62.0, 90.0), Some(Hit::Wifi));
+        assert_eq!(hit_test(&l, 122.0, 90.0), Some(Hit::WifiMore));
+        assert_eq!(hit_test(&l, 726.0, 36.0), Some(Hit::Gear));
         for hit in [Hit::Bluetooth, Hit::BtMore, Hit::Audio, Hit::AudioMore, Hit::MediaPrev, Hit::MediaPlay, Hit::MediaNext] {
             assert!(has(&l, hit), "{hit:?}");
         }
         for tab in [Tab::Resources, Tab::Calendar, Tab::Speed] {
             assert!(has(&l, Hit::Tab(tab)), "{tab:?}");
         }
-        assert_eq!(l.size, (760.0, 444.0));
+        assert_eq!(l.size, (760.0, 482.0));
         assert_eq!(hit_test(&l, 5.0, 5.0), None); // padding
     }
 
@@ -246,7 +254,7 @@ mod tests {
                 assert!(a.right <= l.size.0 && a.bottom <= l.size.1, "{ha:?} outside");
             }
         }
-        assert_eq!(layout(&at(144)).size.1, 444.0 * 1.5);
+        assert_eq!(layout(&at(144)).size.1, 482.0 * 1.5);
     }
 
     fn results(n: usize) -> Vec<AppEntry> {
@@ -263,15 +271,14 @@ mod tests {
         let card = l.menu.expect("menu card");
         let audio = l.rect(Hit::Audio).expect("audio card");
         assert!(card.top >= audio.bottom);
-        // Aligned with the audio card's left edge, 240 wide.
-        assert_eq!((card.left, card.right - card.left), (audio.left, 240.0));
-        // A point on row 0 lies over the tabs area and still hits the output.
-        let tabs = l.rect(Hit::Tab(Tab::Speed)).expect("tabs");
+        // Aligned with the audio card's left edge, 280 wide.
+        assert_eq!((card.left, card.right - card.left), (audio.left, 280.0));
+        // A point on row 0 lies over the player card and still hits the output.
         let row0 = l.rect(Hit::AudioDevice(0)).expect("row 0");
         assert!(row0.top >= card.top + 36.0);
         let (x, y) = ((row0.left + row0.right) / 2.0, row0.top + 2.0);
         assert_eq!(hit_test(&l, x, y), Some(Hit::AudioDevice(0)));
-        assert!(overlap(&row0, &tabs), "the list is over the tabs");
+        assert!(overlap(&row0, &l.media), "the list is over the player");
         assert!(has(&l, Hit::Tab(Tab::Resources)) && has(&l, Hit::Tab(Tab::Speed)));
         assert!(has(&l, Hit::Slider(SliderKind::Volume)));
         // The body no longer changes for audio.

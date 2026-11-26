@@ -113,4 +113,6 @@ pub struct PanelView {
     pub hover: Option<Hit>,
     /// The acrylic backdrop is on: the tint comes from it, not from the drawing.
     pub acrylic: bool,
+    /// Black layer over the content (0..=1) while the panel is a small pill.
+    pub veil: f32,
 }

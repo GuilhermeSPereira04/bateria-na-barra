@@ -6,7 +6,8 @@ use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegG
 use windows::core::w;
 
 /// Preset accent colors offered under the gear, in order.
-pub const ACCENTS: [u32; 8] = [0x9BE3B0, 0x60CDFF, 0xB4A0FF, 0xFF8FB1, 0xFFB86B, 0xF5E07A, 0x7FE0D4, 0xE6E6E6];
+/// The first one (iOS blue) is the default.
+pub const ACCENTS: [u32; 9] = [0x0A84FF, 0x9BE3B0, 0x60CDFF, 0xB4A0FF, 0xFF8FB1, 0xFFB86B, 0xF5E07A, 0x7FE0D4, 0xE6E6E6];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Accent {
@@ -223,6 +224,15 @@ mod tests {
     }
 
     #[test]
+    fn default_accent_is_ios_blue() {
+        assert_eq!(ACCENTS[0], 0x0A84FF);
+        assert_eq!(Config::default().accent, Accent::Preset(0));
+        assert_eq!(parse("accent=preset:0").accent, Accent::Preset(0));
+        assert_eq!(Colors::default().accent, 0x0A84FF);
+        assert_eq!(resolve_with(&parse("accent=preset:0"), 0).accent, 0x0A84FF);
+    }
+
+    #[test]
     fn garbage_falls_back_to_default() {
         assert_eq!(parse("accent=banana\ntint="), Config::default());
         assert_eq!(parse("accent=preset:99\ntint=neon"), Config::default());
@@ -267,7 +277,7 @@ mod tests {
 
     #[test]
     fn resolve_tints() {
-        let c = |tint| resolve_with(&Config { accent: Accent::Preset(1), tint, ..Config::default() }, 0);
+        let c = |tint| resolve_with(&Config { accent: Accent::Preset(2), tint, ..Config::default() }, 0);
         assert_eq!(c(GlassTint::Dark).tint, (0x20242C, 0.55));
         assert_eq!(c(GlassTint::Light).tint, (0xF3F3F3, 0.55));
         assert_eq!(c(GlassTint::Accent).tint, (0x60CDFF, 0.55));
