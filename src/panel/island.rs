@@ -10,8 +10,8 @@ use windows::core::w;
 use crate::render::Bitmap;
 
 /// Size of the pill in DIP.
-pub const PILL_W: f32 = 120.0;
-pub const PILL_H: f32 = 28.0;
+pub const PILL_W: f32 = 64.0;
+pub const PILL_H: f32 = 8.0;
 
 /// Pill size in pixels at `dpi`.
 pub fn pill_size(dpi: u32) -> (i32, i32) {
@@ -172,9 +172,9 @@ mod tests {
     #[test]
     fn island_rect_at_100_and_150_percent() {
         let r = island_rect(MONITOR, 96);
-        assert_eq!((r.left, r.top, r.right, r.bottom), (900, 0, 1020, 28));
+        assert_eq!((r.left, r.top, r.right, r.bottom), (928, 0, 992, 8));
         let r = island_rect(MONITOR, 144);
-        assert_eq!((r.left, r.top, r.right, r.bottom), (870, 0, 1050, 42));
+        assert_eq!((r.left, r.top, r.right, r.bottom), (912, 0, 1008, 12));
         // Second monitor to the right: centered on the given one.
         let r = island_rect(
             RECT {
@@ -185,7 +185,7 @@ mod tests {
             },
             96,
         );
-        assert_eq!(r.left, 1920 + 900);
+        assert_eq!(r.left, 1920 + 928);
     }
 
     #[test]
