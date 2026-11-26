@@ -1,2 +1,17 @@
+# Build
 /target
+*.pdb
+
+# Notas e arquivos locais (não vão pro GitHub)
 /.superpowers
+/docs/superpowers/
+/docs/zaopin-probe.txt
+*.log
+.env
+.env.*
+
+# Editor / sistema
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
