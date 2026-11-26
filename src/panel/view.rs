@@ -115,4 +115,6 @@ pub struct PanelView {
     pub acrylic: bool,
     /// Black layer over the content (0..=1) while the panel is a small pill.
     pub veil: f32,
+    /// Horizontal shift of the drawing in pixels (negative while the panel unfolds, to stay centered).
+    pub shift: f32,
 }

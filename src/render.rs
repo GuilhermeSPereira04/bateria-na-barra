@@ -56,6 +56,11 @@ impl Bitmap {
         }
     }
 
+    /// The same pixels, writable.
+    pub fn pixels_mut(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.bits, (self.width * self.height * 4) as usize) }
+    }
+
     /// BGRA premultiplied, row-major, `width * height * 4` bytes.
     pub fn pixels(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.bits, (self.width * self.height * 4) as usize) }

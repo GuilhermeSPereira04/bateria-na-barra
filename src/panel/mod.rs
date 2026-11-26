@@ -1,13 +1,16 @@
 //! The top panel: a popup with the Windows 11 system backdrop (frosted glass)
 //! drawn over with Direct2D. Created on open and destroyed on close, so no
 //! drawing resources stay allocated while it is closed.
+pub mod anim;
 pub mod draw;
 pub mod glass;
+pub mod island;
 pub mod layout;
 pub mod trigger;
 pub mod view;
 
 use std::cell::{Cell, RefCell};
+use std::time::Instant;
 
 use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::*;
@@ -15,14 +18,15 @@ use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dwm::{
     DWMSBT_NONE, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
-    DWMWCP_ROUND, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
+    DWMWA_TRANSITIONS_FORCEDISABLED, DWMWCP_ROUND, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint, PAINTSTRUCT, ScreenToClient,
+    BeginPaint, CreateRoundRectRgn, EndPaint, InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint, PAINTSTRUCT, ScreenToClient,
+    SetWindowRgn, UpdateWindow,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId};
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, SetProcessWorkingSetSize};
 use windows::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -65,6 +69,12 @@ pub const WM_PANEL_WHEEL: u32 = WM_APP + 14;
 /// Posted to the owner while a bar is dragged; the owner collects the values
 /// with `PanelWindow::take_drags`. wParam: the panel's HWND.
 pub const WM_PANEL_DRAG: u32 = WM_APP + 21;
+
+/// Posted to the owner when a closing animation reached the pill. wParam: the panel's HWND.
+pub const WM_PANEL_ANIM_DONE: u32 = WM_APP + 22;
+
+/// Timer of the open/close animation, on the panel's own window.
+const ANIM_TIMER: usize = 1;
 
 /// Whole wheel notches in an accumulated `WM_MOUSEWHEEL` delta, and the rest
 /// (fine-grained wheels and touchpads send fractions of a notch).
@@ -122,6 +132,14 @@ struct Scene {
     layout: Layout,
 }
 
+/// Open/close animation: `t` is linear progress (0 = pill, 1 = full panel).
+#[derive(Clone, Copy)]
+struct Anim {
+    t: f32,
+    opening: bool,
+    last: Instant,
+}
+
 /// State the window procedure reaches through `GWLP_USERDATA`.
 struct Shared {
     owner: HWND,
@@ -141,6 +159,7 @@ struct Shared {
     drags: RefCell<Vec<(SliderKind, u8, bool)>>,
     /// The acrylic backdrop is on, and the (rgb, alpha) it was applied with.
     glass: Cell<Option<(u32, f32)>>,
+    anim: Cell<Anim>,
 }
 
 fn invalidate(hwnd: HWND) {
@@ -172,6 +191,70 @@ impl Shared {
             s.rt = None;
             s.cache.reset_target();
             invalidate(hwnd);
+        }
+    }
+
+    /// Runs the animation toward open (true) or closed (false) from wherever it is.
+    fn start_anim(&self, hwnd: HWND, opening: bool) {
+        let mut a = self.anim.get();
+        a.opening = opening;
+        a.last = Instant::now();
+        self.anim.set(a);
+        unsafe { SetTimer(Some(hwnd), ANIM_TIMER, anim::FRAME_MS, None) };
+        self.apply_anim(hwnd);
+    }
+
+    fn tick(&self, hwnd: HWND) {
+        let mut a = self.anim.get();
+        let now = Instant::now();
+        a.t = anim::advance(a.t, a.opening, now.duration_since(a.last).as_secs_f32() * 1000.0);
+        a.last = now;
+        self.anim.set(a);
+        let done = a.t == if a.opening { 1.0 } else { 0.0 };
+        if done {
+            let _ = unsafe { KillTimer(Some(hwnd), ANIM_TIMER) };
+            if a.opening {
+                // The frames of the animation left freed heap behind: hand it back.
+                unsafe {
+                    let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+                }
+            }
+        }
+        self.apply_anim(hwnd);
+        if done && !a.opening {
+            post_owner(hwnd, WM_PANEL_ANIM_DONE);
+        }
+    }
+
+    /// Sizes the window to the current shape (between the island's pill and
+    /// the full panel), keeps the content centered in it, rounds its corners
+    /// and repaints with the veil.
+    fn apply_anim(&self, hwnd: HWND) {
+        let t = self.anim.get().t;
+        let e = anim::ease_out(t);
+        let Ok(mut scene) = self.scene.try_borrow_mut() else { return };
+        let dpi = scene.view.dpi;
+        let full = rect_for(scene.layout.size);
+        let pill = island::island_rect(crate::taskbar::primary_monitor_rect(), dpi);
+        let r = if t >= 1.0 { full } else { anim::lerp_rect(pill, full, e) };
+        let (w, h) = (r.right - r.left, r.bottom - r.top);
+        scene.view.veil = anim::veil(e);
+        scene.view.shift = ((w - (full.right - full.left)) / 2) as f32;
+        drop(scene);
+        unsafe {
+            let _ = SetWindowPos(hwnd, None, r.left, r.top, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+            if t >= 1.0 {
+                SetWindowRgn(hwnd, None, true);
+            } else {
+                // The acrylic ignores the region, but the drawing doesn't: this rounds the pill.
+                let radius = (island::pill_size(dpi).1 as f32 / 2.0 * (1.0 - e) + 8.0 * layout::scale(dpi) * e).round() as i32;
+                let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, 2 * radius, 2 * radius);
+                SetWindowRgn(hwnd, Some(rgn), true); // the system owns the region now
+            }
+        }
+        invalidate(hwnd);
+        unsafe {
+            let _ = UpdateWindow(hwnd);
         }
     }
 
@@ -308,7 +391,21 @@ fn post_owner(hwnd: HWND, msg: u32) {
 
 unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let shared = shared_of(hwnd);
+    // While it moves, the mouse does nothing (the content is shifted); once it folds back, nothing does.
+    let mouse = matches!(msg, WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONUP | WM_MOUSEWHEEL);
+    let keys = matches!(msg, WM_KEYDOWN | WM_CHAR | WM_ACTIVATE);
+    if let Some(a) = shared.map(|s| s.anim.get())
+        && ((mouse && (!a.opening || a.t < 1.0)) || (keys && !a.opening))
+    {
+        return LRESULT(0);
+    }
     match msg {
+        WM_TIMER if wp.0 == ANIM_TIMER => {
+            if let Some(shared) = shared {
+                shared.tick(hwnd);
+            }
+            LRESULT(0)
+        }
         WM_PAINT => unsafe {
             let mut ps = PAINTSTRUCT::default();
             BeginPaint(hwnd, &mut ps);
@@ -460,7 +557,7 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
     }
 }
 
-fn primary_dpi() -> u32 {
+pub(crate) fn primary_dpi() -> u32 {
     let mon = unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
     let (mut dx, mut dy) = (96, 96);
     if unsafe { GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy) }.is_ok() { dx.max(96) } else { 96 }
@@ -486,6 +583,16 @@ fn take_focus(hwnd: HWND, previous: HWND) {
         let _ = SetFocus(Some(hwnd));
         if attach {
             let _ = AttachThreadInput(fg_thread, me, false);
+        }
+    }
+}
+
+/// Gives the focus back to `previous` only if `hwnd` still holds it: after a
+/// click outside, the clicked window keeps it.
+fn restore_focus(hwnd: HWND, previous: HWND) {
+    unsafe {
+        if GetForegroundWindow() == hwnd && !previous.is_invalid() && IsWindow(Some(previous)).as_bool() {
+            let _ = SetForegroundWindow(previous);
         }
     }
 }
@@ -517,6 +624,7 @@ impl PanelWindow {
 
             view.dpi = primary_dpi();
             view.hover = None;
+            view.veil = 1.0;
             let layout = layout::layout(&view);
             let r = rect_for(layout.size);
             let shared = Box::new(Shared {
@@ -535,6 +643,7 @@ impl PanelWindow {
                 drag: Cell::new(None),
                 drags: RefCell::new(Vec::new()),
                 glass: Cell::new(None),
+                anim: Cell::new(Anim { t: 0.0, opening: true, last: Instant::now() }),
             });
             // No WS_EX_LAYERED: it would block the system backdrop.
             let hwnd = CreateWindowExW(
@@ -558,6 +667,8 @@ impl PanelWindow {
             };
             set(DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_TRANSIENTWINDOW.0);
             set(DWMWA_USE_IMMERSIVE_DARK_MODE, 1);
+            // Our own animation replaces the system's fade/scale on show and destroy.
+            set(DWMWA_TRANSITIONS_FORCEDISABLED, 1);
             set(DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND.0);
             let margins = MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 };
             let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
@@ -566,7 +677,10 @@ impl PanelWindow {
             shared.apply_glass(hwnd, shared.scene.try_borrow().map(|s| s.view.colors.tint).unwrap_or((0x20242C, 0.55)));
 
             let previous = GetForegroundWindow();
+            // Starts as the island's pill and unfolds.
+            shared.start_anim(hwnd, true);
             let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = UpdateWindow(hwnd);
             take_focus(hwnd, previous);
             // The tray menu leaves our hidden owner in front; nothing to give back to.
             let previous = if previous == owner { HWND::default() } else { previous };
@@ -583,10 +697,32 @@ impl PanelWindow {
     pub fn redraw(&mut self, view: PanelView) {
         let tint = view.colors.tint;
         self.shared.update(self.hwnd, move |current| {
-            let (dpi, hover, acrylic) = (current.dpi, current.hover, current.acrylic);
-            *current = PanelView { dpi, hover, acrylic, ..view };
+            let (dpi, hover, acrylic, veil, shift) = (current.dpi, current.hover, current.acrylic, current.veil, current.shift);
+            *current = PanelView { dpi, hover, acrylic, veil, shift, ..view };
         });
         self.shared.apply_glass(self.hwnd, tint);
+    }
+
+    /// Folds the panel back into the pill (the owner drops it on
+    /// `WM_PANEL_ANIM_DONE`, or when `finished`). Gives the focus back right away.
+    pub fn begin_close(&mut self) {
+        restore_focus(self.hwnd, self.previous);
+        self.previous = HWND::default();
+        self.shared.start_anim(self.hwnd, false);
+    }
+
+    /// Unfolds a panel that was folding back (reopened before it reached the pill).
+    pub fn begin_open(&mut self, owner: HWND) {
+        let previous = unsafe { GetForegroundWindow() };
+        self.shared.start_anim(self.hwnd, true);
+        take_focus(self.hwnd, previous);
+        self.previous = if previous == owner || previous == self.hwnd { HWND::default() } else { previous };
+    }
+
+    /// True once a closing animation reached the pill.
+    pub fn finished(&self) -> bool {
+        let a = self.shared.anim.get();
+        !a.opening && a.t <= 0.0
     }
 
     /// Don't give the focus back on close: an app launched from the panel is
@@ -626,11 +762,7 @@ impl Drop for PanelWindow {
             // Detach first: closing must not post another WM_PANEL_CLOSED, and
             // the window procedure must not touch `shared` once it is freed.
             SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
-            // Give the focus back only if we still hold it: after a click
-            // outside, the clicked window keeps it.
-            if GetForegroundWindow() == self.hwnd && !self.previous.is_invalid() && IsWindow(Some(self.previous)).as_bool() {
-                let _ = SetForegroundWindow(self.previous);
-            }
+            restore_focus(self.hwnd, self.previous);
             let _ = DestroyWindow(self.hwnd);
         }
         // `shared` (render target and factories) is released right after.

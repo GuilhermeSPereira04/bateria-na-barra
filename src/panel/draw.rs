@@ -348,6 +348,7 @@ pub fn draw(rt: &ID2D1RenderTarget, dw: &IDWriteFactory, cache: &mut Cache, view
         unsafe { rt.FillRectangle(&rect(0.0, 0.0, layout.size.0, layout.size.1), brush) };
     }
 
+    unsafe { rt.SetTransform(&Matrix3x2::translation(view.shift, 0.0)) };
     search(&p, view, layout);
     if view.gear_open {
         colors_row(&p, &view.colors, layout);
@@ -364,6 +365,7 @@ pub fn draw(rt: &ID2D1RenderTarget, dw: &IDWriteFactory, cache: &mut Cache, view
         p.hover(r);
     }
     // Opening / closing animation: black over everything while the shape is a pill.
+    unsafe { rt.SetTransform(&Matrix3x2::identity()) };
     if view.veil > 0.0 {
         p.color(rgb(0, view.veil));
         unsafe { rt.FillRectangle(&rect(0.0, 0.0, layout.size.0, layout.size.1), brush) };

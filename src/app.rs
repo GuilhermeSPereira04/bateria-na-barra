@@ -21,11 +21,12 @@ use crate::config::{self, Accent, Colors, Config, GlassTint};
 use crate::media::{self, MediaCmd, NowPlaying};
 use crate::model::{ALL, DeviceKind, ReadOutcome, Tracker};
 use crate::panel::trigger::{CloseRule, EdgeTrigger, Pauses, click_outside_closes, new_press};
+use crate::panel::island::Island;
 use crate::panel::layout::MAX_ROWS;
 use crate::panel::layout::MAX_OUTPUTS;
 use crate::panel::view::{AudioMenu, Hit, Key, PanelView, QuickState, SliderKind, Tab, Toggle};
 use crate::panel::{
-    ASYNC_APPS, ASYNC_AUDIO, ASYNC_MEDIA, ASYNC_RADIOS, ASYNC_SPEED, ASYNC_STATS, PanelWindow, WM_PANEL_ASYNC, WM_PANEL_CLOSED, WM_PANEL_DRAG, WM_PANEL_HIT, WM_PANEL_KEY, WM_PANEL_WHEEL,
+    ASYNC_APPS, ASYNC_AUDIO, ASYNC_MEDIA, ASYNC_RADIOS, ASYNC_SPEED, ASYNC_STATS, PanelWindow, WM_PANEL_ANIM_DONE, WM_PANEL_ASYNC, WM_PANEL_CLOSED, WM_PANEL_DRAG, WM_PANEL_HIT, WM_PANEL_KEY, WM_PANEL_WHEEL,
 };
 use crate::readers::{self, WM_READING};
 use crate::radios::{self, RadioKind, RadioSnapshot};
@@ -113,6 +114,10 @@ struct App {
     dark: bool,
     hook: Option<HWINEVENTHOOK>,
     panel: Option<PanelWindow>,
+    /// A panel folding back into the pill (dropped when it gets there).
+    closing: Option<PanelWindow>,
+    /// The pill shown at the top while the panel is closed.
+    island: Option<Island>,
     edge: EdgeTrigger,
     close: CloseRule,
     /// A mouse button was down at the last `TIMER_EDGE` tick.
@@ -177,7 +182,7 @@ impl App {
     fn menu(&mut self, hwnd: HWND) {
         // The menu makes the owner foreground and runs a nested loop that
         // drops the panel's own close request (APP is borrowed): close it here.
-        self.close_panel();
+        self.close_panel_now();
         match tray::show_menu(hwnd, startup::is_enabled()) {
             tray::CMD_REFRESH => {
                 for r in &self.refresh {
@@ -214,7 +219,23 @@ impl App {
         self.query.clear();
         self.results.clear();
         self.selected = 0;
-        if let Ok(panel) = PanelWindow::open(hwnd, self.panel_view()) {
+        if let Some(island) = self.island.as_mut() {
+            island.hide(); // the panel unfolds from where it was
+        }
+        let view = self.panel_view();
+        let opened = match self.closing.take() {
+            // Reopened while folding back: unfold the same window from where it is.
+            Some(mut panel) => {
+                panel.redraw(view);
+                panel.begin_open(hwnd);
+                Ok(panel)
+            }
+            None => PanelWindow::open(hwnd, view),
+        };
+        if opened.is_err() {
+            self.sync_island();
+        }
+        if let Ok(panel) = opened {
             self.panel = Some(panel);
             self.close = CloseRule::new(); // disarmed until the cursor enters
             // Forget presses from before the panel (the menu click that opened
@@ -576,11 +597,54 @@ impl App {
         self.refresh_panel();
     }
 
+    /// Folds the panel into the pill (shown again once it gets there).
     fn close_panel(&mut self) {
-        if self.panel.is_none() {
-            return;
+        let Some(mut panel) = self.panel.take() else { return };
+        panel.begin_close();
+        self.closing = Some(panel);
+        self.release_panel_state();
+    }
+
+    /// Closes at once, without the animation (menus and display changes run
+    /// nested loops that would drop the animation's messages).
+    fn close_panel_now(&mut self) {
+        self.close_panel();
+        self.drop_closing();
+    }
+
+    /// Drops a panel that reached the pill and brings the island back.
+    fn finish_close(&mut self) {
+        if self.closing.as_ref().is_some_and(|p| p.finished()) {
+            self.drop_closing();
         }
-        self.panel = None;
+    }
+
+    fn drop_closing(&mut self) {
+        self.closing = None;
+        self.sync_island();
+        // Hand the pages the panel touched back to the system.
+        unsafe {
+            let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+        }
+    }
+
+    /// Shows the island while the panel is closed (and not over a fullscreen
+    /// app), hides it otherwise.
+    fn sync_island(&mut self) {
+        let wanted = self.panel.is_none() && self.closing.is_none() && !taskbar::fullscreen_now();
+        if wanted && self.island.is_none() {
+            self.island = Island::create().ok();
+        }
+        if let Some(island) = self.island.as_mut() {
+            if wanted {
+                island.show();
+            } else {
+                island.hide();
+            }
+        }
+    }
+
+    fn release_panel_state(&mut self) {
         // Reopening from the edge takes leaving it first (Esc on the top row).
         self.edge.suppress();
         // The app list and its icons only live while the panel is open.
@@ -596,10 +660,6 @@ impl App {
         self.audio_list_open = false;
         self.results = Vec::new();
         self.query = String::new();
-        // Hand the pages the panel touched back to the system.
-        unsafe {
-            let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
-        }
     }
 
     /// Every `TIMER_EDGE` tick: open on a held top edge, close once the cursor left.
@@ -616,6 +676,9 @@ impl App {
         let now = Instant::now();
         if self.panel.is_some() {
             self.edge.suppress(); // no counting toward a reopen while open
+        }
+        if self.closing.as_ref().is_some_and(|p| p.finished()) {
+            self.finish_close(); // the done message may have been lost in a nested loop
         }
         if self.edge.update(at_top_edge, button_down, now) && self.panel.is_none() && !taskbar::fullscreen_now() {
             self.open_panel(hwnd);
@@ -679,7 +742,15 @@ unsafe extern "system" fn owner_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             }
             app.rebuild();
         }),
-        WM_TIMER if wp.0 == TIMER_SYNC => with_app(|app| app.strip.sync()),
+        WM_TIMER if wp.0 == TIMER_SYNC => with_app(|app| {
+            app.strip.sync();
+            app.sync_island();
+        }),
+        WM_PANEL_ANIM_DONE => with_app(|app| {
+            if app.closing.as_ref().is_some_and(|p| p.hwnd().0 as usize == wp.0) {
+                app.finish_close();
+            }
+        }),
         WM_TIMER if wp.0 == TIMER_EXPIRE => with_app(|app| app.rebuild()),
         WM_TIMER if wp.0 == TIMER_EDGE => with_app(|app| app.edge_tick(hwnd)),
         WM_TIMER if wp.0 == TIMER_MEDIA => with_app(|app| app.media_tick(hwnd)),
@@ -755,11 +826,15 @@ unsafe extern "system" fn owner_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 });
             }
         }
-        WM_TASKBAR_MOVED => with_app(|app| app.strip.sync()),
+        WM_TASKBAR_MOVED => with_app(|app| {
+            app.strip.sync();
+            app.sync_island();
+        }),
         WM_DISPLAYCHANGE | WM_DPICHANGED => with_app(|app| {
             if msg == WM_DISPLAYCHANGE {
-                app.close_panel();
+                app.close_panel_now();
             }
+            app.sync_island();
             app.strip.invalidate();
             app.strip.sync();
         }),
@@ -832,6 +907,8 @@ pub fn run() -> windows::core::Result<()> {
                 dark,
                 hook,
                 panel: None,
+                closing: None,
+                island: None,
                 edge: EdgeTrigger::new(),
                 close: CloseRule::new(),
                 button_was_down: false,
@@ -864,7 +941,10 @@ pub fn run() -> windows::core::Result<()> {
                 speed_cancel: None,
             });
         });
-        with_app(|app| app.rebuild());
+        with_app(|app| {
+            app.rebuild();
+            app.sync_island();
+        });
 
         SetTimer(Some(hwnd), TIMER_SYNC, 1000, None);
         SetTimer(Some(hwnd), TIMER_EXPIRE, 60_000, None);
